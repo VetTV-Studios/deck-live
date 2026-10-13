@@ -1,0 +1,69 @@
+# Deck Live
+
+A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube** or **Twitch** from the Quick Access menu, without switching to Desktop Mode.
+
+## Features
+- Platform picker (YouTube, Twitch) with a masked stream-key field. Keys are stored locally only (`settings.json`, mode 600), redacted from logs, and never passed on a command line.
+- Presets: 720p30, 720p60, 1080p30, **1080p60 (default)**, 1200p60 (16:10). Wider or taller screens are letterboxed, never stretched.
+- Hardware H.264 through VA-API (`vah264enc`), falling back to `vaapih264enc`, then `openh264enc`, then `x264enc`.
+- Game audio from the default output's monitor, plus an optional mic (off by default) with WebRTC noise suppression. Separate game-volume and mic-gain sliders.
+- A/V sync offset slider (−500…+500 ms; default −160 ms, tuned on Legion Go).
+- Live status, uptime, and health (fps, kbps, dropped/duplicated frames, stall warnings).
+- **Auto-reconnect**: after an unexpected drop it retries after 2, 5, 10, 20, then every 30 s, for up to 5 min. The panel shows "Reconnecting (n)…" and uptime is kept. Stop cancels.
+- **Run Diagnostics**: records a 20 s test to `~/Videos/decky-live-test.flv` without going live. It reports capture node, encoder, audio sources and level, frames vs expected, stalls, and file length vs wall-clock time.
+
+## Requirements
+- Decky Loader (API v1) in Game Mode (gamescope exposes the PipeWire video node `gamescope`).
+- PipeWire with pipewire-pulse (`pactl`, `pw-dump`).
+- GStreamer (tested with 1.28; 1.20+ likely needed for the `va` plugin) with `gst-launch-1.0`, `gst-inspect-1.0` and these elements: `pipewiresrc`, `pulsesrc`, `vapostproc`, `vah264enc` (or one of the fallback encoders), `h264parse`, `videorate`, `avenc_aac` (or `fdkaacenc`), `flvmux`, `rtmp2sink`. `level` and `webrtcdsp` are optional.
+- Recommended: system `python3` with PyGObject (`gi`) and GStreamer typelibs. It enables the in-process runner with health stats and clean EOS handling. Without it the plugin falls back to `gst-launch-1.0` (no health stats).
+
+## Tested devices
+| Device | OS | Result |
+|---|---|---|
+| Lenovo Legion Go | Bazzite (GStreamer 1.28.8) | ✅ 1080p60 to YouTube, smooth, in sync at −160 ms |
+| Steam Deck LCD/OLED | SteamOS Stable/Beta/Preview | ❓ untested (SteamOS may lack some GStreamer elements or PyGObject) |
+
+## Install
+1. Download **[Deck-Live-1.0.0.zip](https://github.com/VetTV-Studios/deck-live/releases/download/v1.0.0/Deck-Live-1.0.0.zip)** from the [latest release](https://github.com/VetTV-Studios/deck-live/releases/latest), on the device in Desktop Mode or copied over.
+2. Decky → Settings (gear) → General → enable **Developer mode**.
+3. Decky → Settings → **Developer** → **Install Plugin from ZIP**, browse to the zip, and install. (Or use **Install Plugin from URL** with the zip link above.)
+4. Open Quick Access → **Deck Live**.
+
+Not listed in the Decky Plugin Store.
+
+## Usage
+1. Open Quick Access, then Deck Live.
+2. Choose a platform, paste the stream key, and tap Save Key.
+3. Choose a preset (optional), and tap **Go Live**.
+4. Use **Run Diagnostics** first if anything looks wrong.
+
+## Build
+    pnpm install && pnpm build
+    ./package.sh        # -> ../deck-live.zip (zip of dist/, main.py, gst_worker.py, plugin.json, package.json, LICENSE, README)
+
+## How it works
+`main.py` (the Decky backend) builds a GStreamer pipeline and runs it in `gst_worker.py` (system python3 + PyGObject), falling back to `gst-launch-1.0`:
+
+    pipewiresrc(gamescope, always-copy) → leaky queue → vapostproc (GPU scale, add-borders)
+      → videorate (CFR) → vah264enc (CBR, 2 s GOP, no B-frames) → h264parse → [video delay = −A/V offset]
+    pulsesrc(<default sink>.monitor) [+ mic → webrtcdsp] → audiomixer → [audio delay = +A/V offset] → AAC 160k
+      → flvmux(streamable) → rtmp2sink (async-connect, sync=false)
+
+The worker reports stats as JSON on stdout. The backend forwards them to the panel and logs them every 10 s (Decky plugin log under `~/homebrew/logs/`).
+
+## Ingest URLs
+| Platform | URL |
+|---|---|
+| YouTube | rtmps://a.rtmps.youtube.com:443/live2 |
+| Twitch | rtmp://ingest.global-contribute.live-video.net/app (Twitch's auto/global ingest) |
+
+Kick, Facebook and Rumble can be re-enabled later via `PLATFORMS` and `ENABLED_PLATFORMS` in `main.py`.
+
+## Known limitations
+- One destination at a time; no multistream.
+- Twitch uses the global ingest, not the nearest regional server. Twitch video is capped at 6000 kbps CBR (1080p60/1200p60 6000, 1080p30 and 720p60 4500, 720p30 3000) with a 1 s VBV/CPB buffer, 2 s keyframes and no B-frames. YouTube keeps the full preset bitrates.
+- Gamescope only sends frames when the screen changes. Static scenes are filled with duplicates, which is expected.
+- Changing audio output (for example plugging in headphones) mid-stream keeps capturing the old device until a reconnect or restart.
+- No bitrate adaptation; on weak uplinks use 720p.
+- Not yet tested on SteamOS.
