@@ -1,6 +1,7 @@
 {
   "name": "Deck Live",
   "author": "Vet",
+  "version": "1.0.1",
   "flags": [],
   "api_version": 1,
   "publish": {

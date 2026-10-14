@@ -25,10 +25,24 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 | Steam Deck LCD/OLED | SteamOS Stable/Beta/Preview | ❓ untested (SteamOS may lack some GStreamer elements or PyGObject) |
 
 ## Install
-1. Download **[Deck-Live-1.0.0.zip](https://github.com/VetTV-Studios/deck-live/releases/download/v1.0.0/Deck-Live-1.0.0.zip)** from the [latest release](https://github.com/VetTV-Studios/deck-live/releases/latest), on the device in Desktop Mode or copied over.
+
+### Option 1: installer script (recommended, no developer mode)
+In Desktop Mode, open **Konsole** and run:
+
+    curl -L https://github.com/VetTV-Studios/deck-live/raw/main/install.sh | sh
+
+It checks that Decky Loader is installed and downloads the latest release. It then replaces `~/homebrew/plugins/Deck Live` atomically and restarts Decky (`sudo systemctl restart plugin_loader`). Run it again any time to update.
+It needs `sudo`. On SteamOS, if you've never set a password, run `passwd` first.
+
+To uninstall:
+
+    curl -L https://github.com/VetTV-Studios/deck-live/raw/main/uninstall.sh | sh            # keeps settings and stream keys
+    curl -L https://github.com/VetTV-Studios/deck-live/raw/main/uninstall.sh | PURGE=1 sh    # also deletes settings and keys
+
+### Option 2: ZIP + Decky developer mode
+1. Download the zip from the [latest release](https://github.com/VetTV-Studios/deck-live/releases/latest).
 2. Decky → Settings (gear) → General → enable **Developer mode**.
-3. Decky → Settings → **Developer** → **Install Plugin from ZIP**, browse to the zip, and install. (Or use **Install Plugin from URL** with the zip link above.)
-4. Open Quick Access → **Deck Live**.
+3. Decky → Settings → **Developer** → **Install Plugin from ZIP**, then pick the zip. (Or use **Install Plugin from URL** with `https://github.com/VetTV-Studios/deck-live/releases/latest/download/deck-live.zip`.)
 
 Not listed in the Decky Plugin Store.
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1 — 2026-10-13
+- New `install.sh`: one-line installer and updater (`curl -L …/install.sh | sh`) that needs no Decky developer mode. It downloads the latest release, swaps the plugin folder atomically, and restarts plugin_loader. It works with stock tools (curl, unzip or a python3 fallback, systemctl).
+- New `uninstall.sh` (`PURGE=1` also removes settings and stream keys).
+- Releases now also carry an unversioned `deck-live.zip` asset for a stable `latest/download` URL.
+- No plugin code changes.
+
 ## 1.0.0 — 2026-10-12
 - First release: YouTube (RTMPS) and Twitch streaming from Game Mode.
 - Hardware H.264 (vah264enc → vaapih264enc → openh264enc → x264enc fallback), GPU scaling with aspect preservation, constant-fps output.
