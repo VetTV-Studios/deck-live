@@ -47,7 +47,7 @@ PRESETS = {
 
 DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain": 50, "game_vol": 100, "av_offset": -160,
             "keys": {}, "custom_urls": {},
-            "gh_api_key": "", "gh_pin_channel": "", "gh_enabled": True}
+            "gh_api_key": "", "gh_pin_channel": "UCTf3fhasLYzcP4LmSOd6mIw", "gh_enabled": True}
 
 
 def _load():
