@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased (feature/game-help)
+- Game Help add-on (Stadia Lab spec 04): YouTube help videos for the running game. Topics, custom search, locked-achievement guides, pinned channel, 7-day cache, API quota guard, yt-dlp no-key fallback, offline cache, and pre-fetch on game launch.
+
 ## 1.0.1 — 2026-10-13
 - New `install.sh`: one-line installer and updater (`curl -L …/install.sh | sh`) that needs no Decky developer mode. It downloads the latest release, swaps the plugin folder atomically, and restarts plugin_loader. It works with stock tools (curl, unzip or a python3 fallback, systemctl).
 - New `uninstall.sh` (`PURGE=1` also removes settings and stream keys).

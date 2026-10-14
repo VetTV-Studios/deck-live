@@ -12,6 +12,18 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 - **Auto-reconnect**: after an unexpected drop it retries after 2, 5, 10, 20, then every 30 s, for up to 5 min. The panel shows "Reconnecting (n)…" and uptime is kept. Stop cancels.
 - **Run Diagnostics**: records a 20 s test to `~/Videos/decky-live-test.flv` without going live. It reports capture node, encoder, audio sources and level, frames vs expected, stalls, and file length vs wall-clock time.
 
+## Game Help (preview, branch `feature/game-help`)
+While a game is running, the panel shows YouTube help videos for it:
+- Pick a topic (Walkthrough, Boss guide, Achievements, Best settings for Legion Go, What to do next) or type your own search.
+- Pick one of your **locked achievements** to get guides for it.
+- Tap a video to open it on youtube.com in the Steam overlay browser; press B to return to the game.
+
+How results are fetched:
+- **YouTube API key (optional):** your own YouTube Data API v3 key, set in *Game Help settings*. It's stored locally (mode 600) and never logged. `search.list` has its own default quota of 100 calls/day per Google project, so Deck Live stops at 90 and switches to no-key mode until midnight PT.
+- **No-key mode:** uses `yt-dlp` (on PATH, or tap *Download yt-dlp* to fetch the official release into the plugin's data folder).
+- **Caching:** results are cached for 7 days per game and topic, so reopening the panel uses no quota. When offline, cached results are shown with an "OFFLINE" badge.
+- **Pinned channel:** set a channel ID (e.g. VetTV) to show that channel's matching videos first.
+
 ## Requirements
 - Decky Loader (API v1) in Game Mode (gamescope exposes the PipeWire video node `gamescope`).
 - PipeWire with pipewire-pulse (`pactl`, `pw-dump`).

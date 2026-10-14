@@ -8,6 +8,14 @@ import time
 
 import decky
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import gamehelp
+except Exception as _e:  # never let the add-on break streaming
+    gamehelp = None
+    decky.logger.error(f"Game Help unavailable: {_e}")
+
 SETTINGS_PATH = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
 
 # Ingest endpoints. Stream key is appended at start time.
@@ -38,7 +46,8 @@ PRESETS = {
 }
 
 DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain": 50, "game_vol": 100, "av_offset": -160,
-            "keys": {}, "custom_urls": {}}
+            "keys": {}, "custom_urls": {},
+            "gh_api_key": "", "gh_pin_channel": "", "gh_enabled": True}
 
 
 def _load():
@@ -653,6 +662,57 @@ class Plugin:
         except Exception:
             pass
         return True
+
+    # ---------- Game Help add-on ----------
+    _gh = None
+
+    def _gamehelp(self):
+        if gamehelp is None:
+            raise RuntimeError("Game Help module failed to load")
+        if self._gh is None:
+            self._gh = gamehelp.GameHelp(os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "gamehelp"),
+                                         decky.logger, _user_env)
+        return self._gh
+
+    async def gh_get_settings(self):
+        s = _load()
+        gh = self._gamehelp() if gamehelp else None
+        return {"enabled": s["gh_enabled"], "has_key": bool(s["gh_api_key"]),
+                "pin_channel": s["gh_pin_channel"],
+                "quota_used": gh.quota_used() if gh else 0,
+                "quota_limit": gamehelp.QUOTA_GUARD if gamehelp else 0,
+                "ytdlp": bool(gh and gh.ytdlp_path()),
+                "topics": list(gamehelp.TOPICS.keys()) if gamehelp else []}
+
+    async def gh_set_settings(self, enabled, pin_channel):
+        s = _load()
+        s["gh_enabled"] = bool(enabled)
+        s["gh_pin_channel"] = (pin_channel or "").strip()
+        _save(s)
+        return True
+
+    async def gh_set_api_key(self, key):
+        s = _load()
+        s["gh_api_key"] = (key or "").strip()
+        _save(s)
+        decky.logger.info("Game Help API key " + ("set" if s["gh_api_key"] else "cleared"))  # never log it
+        return True
+
+    async def gh_search(self, game, topic="walkthrough", extra="", refresh=False):
+        s = _load()
+        try:
+            return await self._gamehelp().search(game, topic, extra, s["gh_api_key"],
+                                                 s["gh_pin_channel"], bool(refresh))
+        except Exception as e:
+            decky.logger.exception("Game Help search failed")
+            return {"items": [], "error": str(e)[:300], "provider": None}
+
+    async def gh_install_ytdlp(self):
+        try:
+            path = await self._gamehelp().install_ytdlp()
+            return {"ok": True, "path": path}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:300]}
 
     async def _main(self):
         decky.logger.info("Deck Live loaded")
