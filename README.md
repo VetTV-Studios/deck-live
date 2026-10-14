@@ -32,7 +32,9 @@ In Desktop Mode, open **Konsole** and run:
     curl -L https://github.com/VetTV-Studios/deck-live/raw/main/install.sh | sh
 
 It checks that Decky Loader is installed and downloads the latest release. It then replaces `~/homebrew/plugins/Deck Live` atomically and restarts Decky (`sudo systemctl restart plugin_loader`). Run it again any time to update.
-It needs `sudo`. On SteamOS, if you've never set a password, run `passwd` first.
+> **The installer needs your sudo password.** `~/homebrew/plugins` is owned by root, so the script asks for it.
+> - **SteamOS (Steam Deck):** the `deck` user has no password by default. If you've never set one, open **Konsole** in Desktop Mode and run `passwd` first, then run the installer.
+> - **Bazzite:** use your normal account password.
 
 To uninstall:
 
