@@ -37,7 +37,7 @@ PRESETS = {
     "1200p60 (16:10)": {"w": 1920, "h": 1200, "fps": 60, "kbps": 9500},
 }
 
-DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain": 50, "game_vol": 100, "av_offset": -160,
+DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain": 50, "game_vol": 100, "av_offset": -160, "encoder": "auto",
             "keys": {}, "custom_urls": {}}
 
 
@@ -143,12 +143,125 @@ async def _has_element(name, env):
 
 
 ELEMENTS = ["pipewiresrc", "pulsesrc", "vapostproc", "vah264enc", "vaapih264enc", "openh264enc",
+            "nvh264enc", "nvautogpuh264enc", "cudaupload", "cudaconvertscale",
             "x264enc", "avenc_aac", "webrtcdsp", "audiocheblimit", "audiodynamic", "level", "fdkaacenc", "flvmux", "rtmp2sink", "h264parse", "audiomixer"]
 
 
 async def _available(env):
     res = await asyncio.gather(*[_has_element(e, env) for e in ELEMENTS])
     return dict(zip(ELEMENTS, res))
+
+
+# ---------- encoder selection ----------
+VAAPI_ENCS = ["vah264enc", "vaapih264enc"]
+NVENC_ENCS = ["nvh264enc", "nvautogpuh264enc"]
+SW_ENCS = ["x264enc", "openh264enc"]  # openh264 = last resort (baseline only)
+ENC_FAMILY = {**{e: "vaapi" for e in VAAPI_ENCS}, **{e: "nvenc" for e in NVENC_ENCS},
+              **{e: "software" for e in SW_ENCS}}
+ENCODER_PREFS = ["auto", "vaapi", "nvenc", "software"]
+_VENDORS = {"0x10de": "nvidia", "0x8086": "intel", "0x1002": "amd"}
+
+
+def encoder_order(pref, display_gpu=None):
+    """Candidate encoders, best first. A forced family is tried first, then the normal chain
+    (except 'software', which never silently switches to hardware)."""
+    if pref == "software":
+        return list(SW_ENCS)
+    if pref == "nvenc" or (pref == "auto" and display_gpu == "nvidia"):
+        return NVENC_ENCS + VAAPI_ENCS + SW_ENCS
+    return VAAPI_ENCS + NVENC_ENCS + SW_ENCS
+
+
+def pick_encoder(pref, display_gpu, works):
+    for e in encoder_order(pref, display_gpu):
+        if works.get(e):
+            return e
+    tried = ", ".join(encoder_order(pref, display_gpu))
+    raise RuntimeError(f"No working H.264 encoder (tried {tried}). Run Diagnostics; install "
+                       "gstreamer1-plugins-bad (VA/NVENC) or x264/openh264.")
+
+
+def gpu_info(drm="/sys/class/drm", proc="/proc"):
+    """{'gpus': {card: vendor}, 'display_gpu': vendor|None, 'nvidia': bool, 'source': str}.
+    Heuristic for which GPU gamescope composites on: an explicit --prefer-vk-device on the
+    gamescope command line wins; otherwise the GPU driving the connected (internal first) display."""
+    gpus, display, source = {}, None, "unknown"
+    try:
+        for card in sorted(os.listdir(drm)):
+            if re.fullmatch(r"card\d+", card):
+                try:
+                    with open(os.path.join(drm, card, "device", "vendor")) as f:
+                        gpus[card] = _VENDORS.get(f.read().strip(), "other")
+                except OSError:
+                    pass
+        conns = []
+        for c in os.listdir(drm):
+            m = re.fullmatch(r"(card\d+)-(.+)", c)
+            if not m:
+                continue
+            try:
+                with open(os.path.join(drm, c, "status")) as f:
+                    if f.read().strip() != "connected":
+                        continue
+            except OSError:
+                continue
+            conns.append((0 if m.group(2).startswith("eDP") else 1, m.group(1)))
+        if conns:
+            display = gpus.get(sorted(conns)[0][1])
+            source = "display connector"
+    except OSError:
+        pass
+    try:
+        for pid in os.listdir(proc):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(os.path.join(proc, pid, "cmdline"), "rb") as f:
+                    args = f.read().decode(errors="replace").split("\0")
+            except OSError:
+                continue
+            if args and os.path.basename(args[0]).startswith("gamescope") and "--prefer-vk-device" in args:
+                vid = args[args.index("--prefer-vk-device") + 1].split(":")[0].lower()
+                v = _VENDORS.get("0x" + vid.replace("0x", ""))
+                if v:
+                    display, source = v, "gamescope --prefer-vk-device"
+                break
+    except OSError:
+        pass
+    nvidia = "nvidia" in gpus.values() or os.path.exists("/dev/nvidia0")
+    return {"gpus": gpus, "display_gpu": display, "nvidia": nvidia, "source": source}
+
+
+PROBE_PIPE = ("videotestsrc num-buffers=15 ! video/x-raw,width=640,height=360,framerate=30/1 ! "
+              "videoconvert ! {enc} ! fakesink")
+_probe_cache = None
+
+
+async def probe_encoders(env, have, force=False):
+    """{encoder: {'present': bool, 'works': bool, 'error': str}}. 'present' = factory registered,
+    'works' = a 15-frame test encode reached EOS (nvcodec/VA can register yet fail to open)."""
+    global _probe_cache
+    if _probe_cache is not None and not force:
+        return _probe_cache
+    names = VAAPI_ENCS + NVENC_ENCS + SW_ENCS
+    res = None
+    if await _gi_available(env):
+        out = await _run(f"{SYS_PY} {shlex.quote(WORKER)} --probe " + " ".join(names), env)
+        try:
+            res = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            res = None
+    if res is None:  # gst-launch fallback
+        res = {}
+        for e in names:
+            if not have.get(e):
+                res[e] = {"present": False, "works": False, "error": "not installed"}
+                continue
+            out = await _run(f"timeout 10 gst-launch-1.0 -q {PROBE_PIPE.format(enc=e)} >/dev/null 2>&1 && echo OK", env)
+            res[e] = {"present": True, "works": "OK" in out, "error": "" if "OK" in out else "test encode failed"}
+    _probe_cache = res
+    decky.logger.info("Encoder probe: " + json.dumps({k: v["works"] for k, v in res.items()}))
+    return res
 
 
 RECONNECT_DELAYS = [2, 5, 10, 20, 30]  # then 30 s repeatedly
@@ -214,7 +327,7 @@ NO_NODE_MSG = ("Gamescope capture not found. Open this from Game Mode (not Deskt
 
 
 def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_dev=None,
-                    game_vol=100, mic_gain=50, meter=False, av_offset_ms=0, shell=True):
+                    game_vol=100, mic_gain=50, meter=False, av_offset_ms=0, shell=True, encoder=None):
     """Return (pipeline string, encoder name) or raise RuntimeError.
     shell=True -> quoted for /bin/sh + gst-launch; False -> for Gst.parse_launch (worker)."""
     def qv(v):  # quote a property value
@@ -233,27 +346,44 @@ def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_de
                     f"videorate name=vrate drop-only=false skip-to-first=true ! video/x-raw,framerate={F}/1")
     sw_scale = (f"videoconvert ! videoscale add-borders=true ! video/x-raw,width={W},height={H},format=I420 ! "
                 f"videorate name=vrate drop-only=false skip-to-first=true ! video/x-raw,framerate={F}/1")
-    if have.get("vah264enc"):
-        enc, conv = "vah264enc", scale_va
-        venc = f"vah264enc name=venc target-usage=7 rate-control=cbr bitrate={p['kbps']} cpb-size={p['kbps']} key-int-max={gop} b-frames=0"
+    if encoder is None:  # legacy: first installed encoder in the default chain
+        encoder = next((e for e in VAAPI_ENCS + NVENC_ENCS + SW_ENCS if have.get(e)), None)
+    k = p["kbps"]
+    if encoder == "vah264enc":
+        enc, conv = encoder, scale_va
+        venc = f"vah264enc name=venc target-usage=7 rate-control=cbr bitrate={k} cpb-size={k} key-int-max={gop} b-frames=0"
         prof = "high"
-    elif have.get("vaapih264enc"):
-        enc, conv = "vaapih264enc", (f"videorate name=vrate drop-only=false skip-to-first=true ! "
-                                      f"video/x-raw,framerate={F}/1 ! videoconvert ! vaapipostproc width={W} height={H}")
-        venc = f"vaapih264enc name=venc rate-control=cbr bitrate={p['kbps']} cpb-length=1000 keyframe-period={gop} max-bframes=0"
+    elif encoder == "vaapih264enc":
+        enc, conv = encoder, (f"videorate name=vrate drop-only=false skip-to-first=true ! "
+                              f"video/x-raw,framerate={F}/1 ! videoconvert ! vaapipostproc width={W} height={H}")
+        venc = f"vaapih264enc name=venc rate-control=cbr bitrate={k} cpb-length=1000 keyframe-period={gop} max-bframes=0"
         prof = "high"
-    elif have.get("openh264enc"):
-        enc, conv = "openh264enc", sw_scale
-        venc = (f"openh264enc name=venc rate-control=bitrate bitrate={p['kbps']*1000} gop-size={gop} "
+    elif encoder in NVENC_ENCS:
+        enc = encoder
+        if have.get("cudaupload") and have.get("cudaconvertscale"):
+            # system-memory capture -> CUDA upload, GPU convert+scale (keeps aspect), stays in CUDA memory
+            conv = ("cudaupload ! cudaconvertscale add-borders=true ! "
+                    + qc(f"video/x-raw(memory:CUDAMemory),width={W},height={H},format=NV12")
+                    + " ! videorate name=vrate drop-only=false skip-to-first=true ! "
+                    + qc(f"video/x-raw(memory:CUDAMemory),framerate={F}/1"))
+        else:  # nvh264enc also accepts system-memory NV12 (uploads internally)
+            conv = (f"videoconvert ! videoscale add-borders=true ! video/x-raw,width={W},height={H},format=NV12 ! "
+                    f"videorate name=vrate drop-only=false skip-to-first=true ! video/x-raw,framerate={F}/1")
+        venc = (f"{encoder} name=venc rc-mode=cbr bitrate={k} vbv-buffer-size={k} gop-size={gop} bframes=0 "
+                f"preset=p4 tune=low-latency zerolatency=true repeat-sequence-header=true")
+        prof = "high"
+    elif encoder == "x264enc":
+        enc, conv = encoder, sw_scale
+        venc = f"x264enc name=venc tune=zerolatency speed-preset=veryfast bitrate={k} vbv-buf-capacity=1000 key-int-max={gop} bframes=0"
+        prof = "main"
+    elif encoder == "openh264enc":
+        enc, conv = encoder, sw_scale
+        venc = (f"openh264enc name=venc rate-control=bitrate bitrate={k*1000} gop-size={gop} "
                 f"complexity=low usage-type=screen")
         prof = None  # openh264 only does constrained-baseline; let it negotiate
-    elif have.get("x264enc"):
-        enc, conv = "x264enc", sw_scale
-        venc = f"x264enc name=venc tune=zerolatency speed-preset=veryfast bitrate={p['kbps']} vbv-buf-capacity=1000 key-int-max={gop} bframes=0"
-        prof = "main"
     else:
-        raise RuntimeError("No H.264 encoder found (tried vah264enc, vaapih264enc, openh264enc, x264enc). "
-                           "Install gstreamer1-plugins-bad (VA) or openh264.")
+        raise RuntimeError("No H.264 encoder found (tried vah264enc, vaapih264enc, nvh264enc, "
+                           "nvautogpuh264enc, x264enc, openh264enc).")
     aenc = "avenc_aac" if have.get("avenc_aac") else ("fdkaacenc" if have.get("fdkaacenc") else None)
     if not aenc:
         raise RuntimeError("No AAC encoder found (avenc_aac / fdkaacenc)")
@@ -332,14 +462,14 @@ class Plugin:
             "platforms": [{"id": k, "label": v["label"], "needs_url": not v["url"]} for k, v in PLATFORMS.items() if k in ENABLED_PLATFORMS],
             "presets": list(PRESETS.keys()),
             "bitrates": {pl: {pr: _effective_kbps(pl, pr) for pr in PRESETS} for pl in ENABLED_PLATFORMS},
-            "platform": s["platform"], "preset": s["preset"], "mic": s["mic"], "mic_gain": s["mic_gain"], "game_vol": s["game_vol"], "av_offset": s["av_offset"],
+            "platform": s["platform"], "preset": s["preset"], "mic": s["mic"], "mic_gain": s["mic_gain"], "game_vol": s["game_vol"], "av_offset": s["av_offset"], "encoder": s.get("encoder", "auto"), "encoder_prefs": ENCODER_PREFS,
             "has_key": {k: bool(v) for k, v in s["keys"].items()},
             "custom_urls": s["custom_urls"],
             "live": self._live(), "reconnecting": self.reconnecting,
             "started_at": self.started_at, "error": self.last_error,
         }
 
-    async def save_settings(self, platform, preset, mic, mic_gain=50, game_vol=100, av_offset=0):
+    async def save_settings(self, platform, preset, mic, mic_gain=50, game_vol=100, av_offset=0, encoder=None):
         s = _load()
         if platform in ENABLED_PLATFORMS:
             s["platform"] = platform
@@ -349,6 +479,8 @@ class Plugin:
         s["mic_gain"] = max(0, min(100, int(mic_gain)))
         s["game_vol"] = max(0, min(100, int(game_vol)))
         s["av_offset"] = max(-500, min(500, int(av_offset)))
+        if encoder in ENCODER_PREFS:
+            s["encoder"] = encoder
         _save(s)
         return True
 
@@ -411,13 +543,15 @@ class Plugin:
             raise RuntimeError(NO_NODE_MSG)
         game_dev, mic_dev = await _resolve_audio(env)
         decky.logger.info(f"Audio: game={game_dev} mic={mic_dev if s['mic'] else 'off'}")
-        proc, mode, enc = await _spawn(env, dict(
+        enc_name, ginfo = await self._choose_encoder(env, ctx["have"], s.get("encoder", "auto"))
+        proc, mode, enc = await _spawn(env, dict(encoder=enc_name,
             have=ctx["have"], node=node, p=ctx["p"], mic=s["mic"], sink_el="rtmp2sink",
             location=ctx["location"], game_dev=game_dev, mic_dev=mic_dev, game_vol=s["game_vol"],
             mic_gain=s["mic_gain"], av_offset_ms=s["av_offset"]))
         decky.logger.info(f"Started ({mode}, encoder {enc}, preset {s['preset']}) -> {ctx['base']}/<redacted>")
         self.proc = proc
-        self.health = {"mode": mode}
+        self.encoder = enc
+        self.health = {"mode": mode, "encoder": enc}
         return proc, mode
 
     async def _emit_status(self):
@@ -492,7 +626,7 @@ class Plugin:
             except ValueError:
                 continue
             if "stats" in msg:
-                self.health = {"mode": mode, **msg["stats"]}
+                self.health = {"mode": mode, "encoder": self.encoder, **msg["stats"]}
                 await decky.emit("stream_health", self.health)
                 if time.time() - last_log >= 10:
                     last_log = time.time()
@@ -547,7 +681,10 @@ class Plugin:
         out["mic_source"] = (mic_dev or "default (unresolved)") if st["mic"] else "off"
         out["av_offset"] = st["av_offset"]
         try:
-            proc, mode, enc = await _spawn(env, dict(
+            enc_name, ginfo = await self._choose_encoder(env, have, st.get("encoder", "auto"), force_probe=True)
+            out["encoder_pref"], out["gpu"] = st.get("encoder", "auto"), ginfo
+            out["encoder_probe"] = {k: v["works"] for k, v in (await probe_encoders(env, have)).items()}
+            proc, mode, enc = await _spawn(env, dict(encoder=enc_name,
                 have=have, node=pick["id"], p=p, mic=st["mic"], sink_el="filesink", location=path,
                 game_dev=game_dev, mic_dev=mic_dev, game_vol=st["game_vol"], mic_gain=st["mic_gain"],
                 meter=True, av_offset_ms=st["av_offset"], _duration=seconds))
@@ -653,6 +790,21 @@ class Plugin:
         except Exception:
             pass
         return True
+
+    encoder = None
+
+    async def _choose_encoder(self, env, have, pref, force_probe=False):
+        works = {k: v["works"] for k, v in (await probe_encoders(env, have, force_probe)).items()}
+        ginfo = gpu_info()
+        enc = pick_encoder(pref, ginfo["display_gpu"], works)
+        decky.logger.info(f"Encoder: pref={pref} display_gpu={ginfo['display_gpu']} ({ginfo['source']}) -> {enc}")
+        return enc, ginfo
+
+    async def get_encoders(self):
+        env = _user_env()
+        have = await _available(env)
+        probe = await probe_encoders(env, have, force=True)
+        return {"probe": probe, "gpu": gpu_info(), "families": ENC_FAMILY}
 
     async def _main(self):
         decky.logger.info("Deck Live loaded")

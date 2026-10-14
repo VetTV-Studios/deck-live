@@ -8,22 +8,22 @@ import { FaBroadcastTower } from "react-icons/fa";
 
 type Platform = { id: string; label: string; needs_url: boolean };
 type State = {
-  platforms: Platform[]; presets: string[]; bitrates: Record<string, Record<string, number>>; platform: string; preset: string; mic: boolean; mic_gain: number; game_vol: number; av_offset: number;
+  platforms: Platform[]; presets: string[]; bitrates: Record<string, Record<string, number>>; platform: string; preset: string; mic: boolean; mic_gain: number; game_vol: number; av_offset: number; encoder: string; encoder_prefs: string[];
   has_key: Record<string, boolean>; custom_urls: Record<string, string>;
   live: boolean; started_at: number | null; error: string; reconnecting?: number;
 };
-type Health = { mode?: string; fps?: number; kbps?: number; dropped?: number; duplicated?: number;
+type Health = { mode?: string; encoder?: string; fps?: number; kbps?: number; dropped?: number; duplicated?: number;
   q_overruns?: number; lag_ms?: number | null; gap_ms?: number };
 type Status = { live: boolean; started_at: number | null; error: string; reconnecting?: number };
 
 const getState = callable<[], State>("get_state");
-const saveSettings = callable<[string, string, boolean, number, number, number], boolean>("save_settings");
+const saveSettings = callable<[string, string, boolean, number, number, number, string], boolean>("save_settings");
 const setStreamKey = callable<[string, string], boolean>("set_stream_key");
 const setCustomUrl = callable<[string, string], boolean>("set_custom_url");
 const startStream = callable<[], { ok: boolean; error?: string }>("start_stream");
 type Diag = { ok: boolean; elements: Record<string, boolean>; nodes: string[]; node: string | null;
   encoder: string | null; file: string | null; size: number; error: string;
-  game_source: string | null; mic_source: string | null; game_peak_db: number | null; av_offset?: number; mode?: string | null; seconds?: number;
+  game_source: string | null; mic_source: string | null; game_peak_db: number | null; av_offset?: number; encoder_pref?: string; gpu?: { display_gpu: string | null }; encoder_probe?: Record<string, boolean>; mode?: string | null; seconds?: number;
   frames?: number | null; expected_frames?: number | null; file_duration?: number | null; max_gap_ms?: number | null;
   dropped?: number | null; duplicated?: number | null; src_fps?: number | null; media_duration?: number | null; wall_seconds?: number | null; warnings?: string[] };
 const runDiagnostics = callable<[], Diag>("run_diagnostics");
@@ -64,7 +64,7 @@ function Content() {
   const update = async (patch: Partial<State>) => {
     const n = { ...st, ...patch };
     setSt(n);
-    await saveSettings(n.platform, n.preset, n.mic, n.mic_gain, n.game_vol, n.av_offset);
+    await saveSettings(n.platform, n.preset, n.mic, n.mic_gain, n.game_vol, n.av_offset, n.encoder);
     if (patch.platform) { setKeyInput(""); setUrlInput(n.custom_urls[n.platform] ?? ""); }
   };
 
@@ -93,7 +93,7 @@ function Content() {
             <div style={{ fontSize: 11, color: (health.gap_ms ?? 0) > 500 || (health.kbps ?? 1) === 0 ? "#fa0" : "#aaa" }}>
               {health.fps === undefined
                 ? (health.mode === "gst-launch" ? "Health: unavailable (no PyGObject)" : "Health: waiting…")
-                : `Health: ${health.fps} fps · ${health.kbps} kbps · dropped ${(health.dropped ?? 0) + (health.q_overruns ?? 0)}` +
+                : `Health: ${health.encoder ? health.encoder + " · " : ""}${health.fps} fps · ${health.kbps} kbps · dropped ${(health.dropped ?? 0) + (health.q_overruns ?? 0)}` +
                   ` · dup ${health.duplicated ?? 0}` + ((health.gap_ms ?? 0) > 500 ? ` · STALL ${health.gap_ms} ms` : "")}
             </div>
           </PanelSectionRow>
@@ -150,6 +150,13 @@ function Content() {
             showValue disabled={st.live} onChange={(v) => update({ game_vol: v })} />
         </PanelSectionRow>
         <PanelSectionRow>
+          <DropdownItem label="Encoder" disabled={st.live}
+            description="Auto: VA-API, or NVENC when the display runs on an NVIDIA GPU; falls back to the next working encoder"
+            rgOptions={(st.encoder_prefs ?? ["auto"]).map((e) => ({ data: e,
+              label: ({ auto: "Auto", vaapi: "VA-API", nvenc: "NVENC", software: "Software" } as Record<string, string>)[e] ?? e }))}
+            selectedOption={st.encoder ?? "auto"} onChange={(o) => update({ encoder: o.data })} />
+        </PanelSectionRow>
+        <PanelSectionRow>
           <SliderField label={`A/V sync: ${st.av_offset > 0 ? "+" : ""}${st.av_offset} ms`}
             description="− = audio earlier (fix lagging audio), + = audio later"
             value={st.av_offset} min={-500} max={500} step={20}
@@ -177,7 +184,8 @@ function Content() {
                 {diag.ok ? "✅ Capture test passed" : "❌ " + (diag.error || "Test failed")}
               </div>
               <div>Capture node: {diag.node ?? "not found"}</div>
-              <div>Encoder: {diag.encoder ?? "none"}</div>
+              <div>Encoder: {diag.encoder ?? "none"} (setting: {diag.encoder_pref ?? "auto"}, display GPU: {diag.gpu?.display_gpu ?? "?"})</div>
+              {diag.encoder_probe && <div>Encoders working: {Object.keys(diag.encoder_probe).filter((k) => diag.encoder_probe![k]).join(", ") || "none"}</div>}
               {(diag.warnings ?? []).map((w) => <div style={{ color: "#fa0" }}>⚠ {w}</div>)}
               <div>Frames: {diag.frames ?? "n/a"} / {diag.expected_frames ?? "?"} expected · max gap {diag.max_gap_ms ?? "n/a"} ms</div>
               <div>Capture (gamescope) {diag.src_fps ?? "n/a"} fps unique · encoded/duplicated by videorate {diag.duplicated ?? "n/a"}</div>

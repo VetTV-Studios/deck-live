@@ -12,6 +12,17 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 - **Auto-reconnect**: after an unexpected drop it retries after 2, 5, 10, 20, then every 30 s, for up to 5 min. The panel shows "Reconnecting (n)…" and uptime is kept. Stop cancels.
 - **Run Diagnostics**: records a 20 s test to `~/Videos/decky-live-test.flv` without going live. It reports capture node, encoder, audio sources and level, frames vs expected, stalls, and file length vs wall-clock time.
 
+## Encoder selection (branch `feature/encoder-fallback`)
+**Encoder** setting: *Auto* / *VA-API* / *NVENC* / *Software*.
+- **Startup probe:** at the first stream (and on every Diagnostics run) each encoder gets a 15-frame test encode, since VA and NVENC can be installed but still fail to open the GPU.
+- **Order:** `vah264enc` → `vaapih264enc` → `nvh264enc` / `nvautogpuh264enc` → `x264enc` → `openh264enc` (last resort).
+- **Auto:** puts NVENC first when the display (gamescope) runs on an NVIDIA GPU, detected from `gamescope --prefer-vk-device 10de:…` or from the DRM card driving the connected display, internal panel first. Otherwise VA-API comes first.
+- **Forcing a family:** forcing VA-API or NVENC still falls back along the chain if it doesn't work. *Software* never switches to hardware.
+- **NVENC path:**
+  - Encoder settings: `cudaupload ! cudaconvertscale add-borders=true` (GPU scale, kept in CUDA memory) → `nvh264enc rc-mode=cbr bitrate=N vbv-buffer-size=N gop-size=fps*2 bframes=0 preset=p4 tune=low-latency zerolatency=true repeat-sequence-header=true`.
+  - Without the CUDA elements, frames are converted and scaled on the CPU (`videoconvert ! videoscale`) and passed to nvh264enc in system memory.
+- **Health line:** shows the encoder in use.
+
 ## Requirements
 - Decky Loader (API v1) in Game Mode (gamescope exposes the PipeWire video node `gamescope`).
 - PipeWire with pipewire-pulse (`pactl`, `pw-dump`).

@@ -9,6 +9,39 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
 Gst.init(None)
+
+PROBE_PIPE = ("videotestsrc num-buffers=15 ! video/x-raw,width=640,height=360,framerate=30/1 ! "
+              "videoconvert ! {enc} ! fakesink")
+
+
+def probe(names):
+    """Gst.ElementFactory.find + a 15-frame test encode per encoder (nvcodec/VA may register
+    but fail to open the device). Prints one JSON line."""
+    res = {}
+    for n in names:
+        if Gst.ElementFactory.find(n) is None:
+            res[n] = {"present": False, "works": False, "error": "not installed"}
+            continue
+        err = ""
+        try:
+            p = Gst.parse_launch(PROBE_PIPE.format(enc=n))
+            p.set_state(Gst.State.PLAYING)
+            msg = p.get_bus().timed_pop_filtered(8 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            if msg is None:
+                err = "timeout"
+            elif msg.type == Gst.MessageType.ERROR:
+                err = msg.parse_error()[0].message
+            p.set_state(Gst.State.NULL)
+        except Exception as e:  # parse/instantiate failure
+            err = str(e)
+        res[n] = {"present": True, "works": not err, "error": err[:200]}
+    print(json.dumps(res), flush=True)
+
+
+if len(sys.argv) > 2 and sys.argv[1] == "--probe":
+    probe(sys.argv[2:])
+    sys.exit(0)
+
 cfg = json.loads(sys.stdin.read())
 pipe = Gst.parse_launch(cfg["pipeline"])
 loop = GLib.MainLoop()

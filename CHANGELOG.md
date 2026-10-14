@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased (feature/encoder-fallback)
+- Encoder fallback chain: VA-API, then NVENC (nvh264enc/nvautogpuh264enc, CUDA upload and scale), then x264, then openh264. Each encoder is checked with a test encode before use.
+- Encoder setting (Auto/VA-API/NVENC/Software). Auto prefers NVENC when the display runs on an NVIDIA GPU.
+- The encoder in use is shown in the Health line and in Diagnostics (with probe results and the display GPU).
+
 ## 1.0.1 — 2026-10-13
 - New `install.sh`: one-line installer and updater (`curl -L …/install.sh | sh`) that needs no Decky developer mode. It downloads the latest release, swaps the plugin folder atomically, and restarts plugin_loader. It works with stock tools (curl, unzip or a python3 fallback, systemctl).
 - New `uninstall.sh` (`PURGE=1` also removes settings and stream keys).
