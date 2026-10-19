@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased (feature/clean-mic-source)
+- New **Mic source** picker in the Quick Access panel (shown when Microphone is on). It offers the system default mic, any connected mic, and **Clean Mic (noise-cancelled)** when the [Clean Mic](https://github.com/VetTV-Studios/clean-mic) plugin is running (`clean_mic` node).
+- With Clean Mic as the source, whether picked directly or because it's the system default, the mic branch skips `webrtcdsp` and the expander and keeps only the 100 Hz high-pass.
+- If the chosen source is missing at Go Live, Deck Live falls back to the default mic with its normal noise filter, and logs and shows the reason in Diagnostics.
+- The new `mic_source` setting defaults to `""` (system default), so existing settings behave exactly as before.
+
 ## 1.0.2 — 2026-10-18
 - Security: Go Live no longer falls back to `gst-launch-1.0` when PyGObject is missing. That fallback put the RTMP URL with the stream key on the command line, readable by any local process through `/proc/<pid>/cmdline`. Streaming now refuses to start with a clear message (install `python3-gobject` or update Bazzite/SteamOS). Diagnostics, which only writes a local file, can still use gst-launch.
 - A failed PyGObject check is no longer cached, so installing `python3-gobject` works after a reload instead of a Decky restart.

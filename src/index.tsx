@@ -10,8 +10,11 @@ type Platform = { id: string; label: string; needs_url: boolean };
 type State = {
   platforms: Platform[]; presets: string[]; bitrates: Record<string, Record<string, number>>; platform: string; preset: string; mic: boolean; mic_gain: number; game_vol: number; av_offset: number;
   has_key: Record<string, boolean>; custom_urls: Record<string, string>;
-  live: boolean; started_at: number | null; error: string; reconnecting?: number;
+  live: boolean; started_at: number | null; error: string; reconnecting?: number; mic_source?: string;
 };
+type MicSource = { name: string; desc: string; clean: boolean };
+type MicSources = { selected: string; default: string | null; clean_mic_present: boolean;
+  clean_mic_node: string; sources: MicSource[] };
 type Health = { mode?: string; fps?: number; kbps?: number; dropped?: number; duplicated?: number;
   q_overruns?: number; lag_ms?: number | null; gap_ms?: number };
 type Status = { live: boolean; started_at: number | null; error: string; reconnecting?: number };
@@ -28,6 +31,21 @@ type Diag = { ok: boolean; elements: Record<string, boolean>; nodes: string[]; n
   dropped?: number | null; duplicated?: number | null; src_fps?: number | null; media_duration?: number | null; wall_seconds?: number | null; warnings?: string[] };
 const runDiagnostics = callable<[], Diag>("run_diagnostics");
 const stopStream = callable<[], boolean>("stop_stream");
+const getMicSources = callable<[], MicSources>("get_mic_sources");
+const setMicSource = callable<[string], { ok: boolean; mic_source?: string; error?: string }>("set_mic_source");
+
+function micOptions(m: MicSources | null) {
+  const opts = [{ data: "", label: "System default mic" }];
+  if (!m) return opts;
+  for (const s of m.sources) opts.push({ data: s.name, label: s.clean ? `✨ ${s.desc}` : s.desc });
+  if (!m.clean_mic_present) {
+    opts.push({ data: m.clean_mic_node, label: "Clean Mic (not running)" });
+  }
+  if (m.selected && !opts.some((o) => o.data === m.selected)) {
+    opts.push({ data: m.selected, label: `${m.selected} (not connected)` });
+  }
+  return opts;
+}
 
 const fmt = (s: number) =>
   [Math.floor(s / 3600), Math.floor((s % 3600) / 60), Math.floor(s % 60)]
@@ -42,6 +60,8 @@ function Content() {
   const [diagBusy, setDiagBusy] = useState(false);
   const [health, setHealth] = useState<Health>({});
   const [now, setNow] = useState(Date.now() / 1000);
+  const [mics, setMics] = useState<MicSources | null>(null);
+  const loadMics = async () => { try { setMics(await getMicSources()); } catch (e) { /* older backend */ } };
 
   const refresh = async () => {
     const s = await getState();
@@ -51,6 +71,7 @@ function Content() {
 
   useEffect(() => {
     refresh();
+    loadMics();
     const t = setInterval(() => setNow(Date.now() / 1000), 1000);
     const l = addEventListener<[Status]>("stream_status", (s) =>
       setSt((p) => (p ? { ...p, ...s } : p)));
@@ -155,6 +176,24 @@ function Content() {
             value={st.av_offset} min={-500} max={500} step={20}
             disabled={st.live} onChange={(v) => update({ av_offset: v })} />
         </PanelSectionRow>
+        {st.mic && (
+          <PanelSectionRow>
+            <DropdownItem label="Mic source" disabled={st.live}
+              rgOptions={micOptions(mics)} selectedOption={mics?.selected ?? st.mic_source ?? ""}
+              onMenuOpened={loadMics}
+              onChange={async (o) => {
+                await setMicSource(o.data as string);
+                await loadMics();
+              }} />
+          </PanelSectionRow>
+        )}
+        {st.mic && mics && (mics.selected === mics.clean_mic_node || mics.default === mics.clean_mic_node) && (
+          <PanelSectionRow>
+            <Field label="Clean Mic" description={mics.clean_mic_present
+              ? "Noise-cancelled by the Clean Mic plugin. Deck Live's own noise filter is turned off to avoid double processing."
+              : "Clean Mic isn't running, so Deck Live will use the default mic with its own noise filter. Turn on Clean Mic in its plugin panel."} />
+          </PanelSectionRow>
+        )}
         {st.mic && (
           <PanelSectionRow>
             <SliderField label="Mic gain (50% = normal)" value={st.mic_gain} min={0} max={100} step={5}

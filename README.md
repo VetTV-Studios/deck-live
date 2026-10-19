@@ -7,6 +7,7 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 - Presets: 720p30, 720p60, 1080p30, **1080p60 (default)**, 1200p60 (16:10). Wider or taller screens are letterboxed, never stretched.
 - Hardware H.264 through VA-API (`vah264enc`), falling back to `vaapih264enc`, then `openh264enc`, then `x264enc`.
 - Game audio from the default output's monitor, plus an optional mic (off by default) with WebRTC noise suppression. Separate game-volume and mic-gain sliders.
+- **Mic source** picker: the system default mic, a specific mic, or **Clean Mic (noise-cancelled)** from the [Clean Mic](https://github.com/VetTV-Studios/clean-mic) plugin. When Clean Mic is the source, Deck Live turns off its own noise filter so your voice isn't processed twice. If Clean Mic isn't running when you go live, Deck Live falls back to the default mic with its own filter.
 - A/V sync offset slider (−500…+500 ms; default −160 ms, tuned on Legion Go).
 - Live status, uptime, and health (fps, kbps, dropped/duplicated frames, stall warnings).
 - **Auto-reconnect**: after an unexpected drop it retries after 2, 5, 10, 20, then every 30 s, for up to 5 min. The panel shows "Reconnecting (n)…" and uptime is kept. Stop cancels.

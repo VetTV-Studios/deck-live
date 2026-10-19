@@ -39,7 +39,7 @@ PRESETS = {
 }
 
 DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain": 50, "game_vol": 100, "av_offset": -160,
-            "keys": {}, "custom_urls": {}}
+            "mic_source": "", "keys": {}, "custom_urls": {}}
 
 
 def _load():
@@ -180,6 +180,70 @@ async def _resolve_audio(env):
     return game, src
 
 
+# ---------- mic source picker (Clean Mic integration) ----------
+# The Clean Mic plugin (github.com/VetTV-Studios/clean-mic) publishes a noise-cancelled
+# PipeWire Audio/Source with this node.name. When it is the mic we capture, Deck Live skips its
+# own webrtcdsp noise suppression so the voice isn't denoised twice.
+CLEAN_MIC_NODE = "clean_mic"
+CLEAN_MIC_LABEL = "Clean Mic (noise-cancelled)"
+_SAFE_NODE_RE = re.compile(r"^[A-Za-z0-9_.:\-@+]{1,200}$")
+
+
+def _safe_node_name(name):
+    return isinstance(name, str) and bool(_SAFE_NODE_RE.match(name))
+
+
+def _parse_mic_sources(dump):
+    """Microphones from pw-dump JSON: [{name, desc, clean}], Clean Mic first, no monitors."""
+    out = []
+    for obj in dump or []:
+        if not isinstance(obj, dict) or not obj.get("type", "").endswith("Node"):
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("media.class") not in ("Audio/Source", "Audio/Source/Virtual"):
+            continue
+        name = props.get("node.name", "")
+        if not _safe_node_name(name) or name.endswith(".monitor"):
+            continue
+        clean = name == CLEAN_MIC_NODE
+        desc = CLEAN_MIC_LABEL if clean else (props.get("node.description") or props.get("node.nick") or name)
+        out.append({"name": name, "desc": desc, "clean": clean})
+    out.sort(key=lambda m: (not m["clean"], m["desc"].lower()))
+    return out
+
+
+def _pick_mic(setting, sources, default_src):
+    """Return (device or None, is_clean_mic, note).
+
+    setting: "" = the system default mic, "clean_mic" = Clean Mic, anything else = that node.
+    A chosen source that isn't present falls back to the default mic (and says so)."""
+    names = {m["name"] for m in sources}
+    note = None
+    if setting and setting in names:
+        dev = setting
+    else:
+        if setting:
+            note = ("Clean Mic is not running; using the default mic with Deck Live's own noise filter"
+                    if setting == CLEAN_MIC_NODE else f"Mic '{setting}' not found; using the default mic")
+        dev = default_src
+    return dev, dev == CLEAN_MIC_NODE, note
+
+
+async def _mic_sources(env):
+    if not shutil.which("pw-dump"):
+        return []
+    try:
+        return _parse_mic_sources(json.loads(await _run("pw-dump", env) or "[]"))
+    except Exception as e:
+        decky.logger.warning(f"pw-dump (mic list) failed: {e}")
+        return []
+
+
+async def _resolve_mic(env, s, default_src):
+    sources = await _mic_sources(env) if s.get("mic_source") or default_src == CLEAN_MIC_NODE else []
+    return _pick_mic(s.get("mic_source") or "", sources, default_src)
+
+
 async def _has_element(name, env):
     return bool(await _run(f"gst-inspect-1.0 {shlex.quote(name)}", env))
 
@@ -266,7 +330,7 @@ NO_NODE_MSG = ("Gamescope capture not found. Open this from Game Mode (not Deskt
 
 
 def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_dev=None,
-                    game_vol=100, mic_gain=50, meter=False, av_offset_ms=0, shell=True):
+                    game_vol=100, mic_gain=50, meter=False, av_offset_ms=0, shell=True, mic_clean=False):
     """Return (pipeline string, encoder name) or raise RuntimeError.
     shell=True -> quoted for /bin/sh + gst-launch; False -> for Gst.parse_launch (worker)."""
     def qv(v):  # quote a property value
@@ -331,7 +395,12 @@ def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_de
     if mic:
         mdev = f"device={qv(mic_dev)}" if mic_dev else ""
         mvol = max(0, min(100, int(mic_gain))) / 50.0  # 50% = unity, 100% = 2x
-        if have.get("webrtcdsp"):
+        if mic_clean:
+            # Already denoised by Clean Mic: keep only the rumble high-pass, no second denoiser/gate.
+            clean = "audioconvert ! "
+            if have.get("audiocheblimit"):
+                clean += "audiocheblimit mode=high-pass cutoff=100 ! "
+        elif have.get("webrtcdsp"):
             clean = ("audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=1 ! "
                      "webrtcdsp echo-cancel=false noise-suppression=true noise-suppression-level=high "
                      "high-pass-filter=true gain-control=false ! ")
@@ -385,6 +454,7 @@ class Plugin:
             "presets": list(PRESETS.keys()),
             "bitrates": {pl: {pr: _effective_kbps(pl, pr) for pr in PRESETS} for pl in ENABLED_PLATFORMS},
             "platform": s["platform"], "preset": s["preset"], "mic": s["mic"], "mic_gain": s["mic_gain"], "game_vol": s["game_vol"], "av_offset": s["av_offset"],
+            "mic_source": s.get("mic_source") or "",
             "has_key": {k: bool(v) for k, v in s["keys"].items()},
             "custom_urls": s["custom_urls"],
             "live": self._live(), "reconnecting": self.reconnecting,
@@ -403,6 +473,25 @@ class Plugin:
         s["av_offset"] = max(-500, min(500, int(av_offset)))
         _save(s)
         return True
+
+    async def get_mic_sources(self):
+        """Mic picker contents: system default, then Clean Mic (if running), then other mics."""
+        s = _load()
+        env = _user_env()
+        sources = await _mic_sources(env)
+        _game, default_src = await _resolve_audio(env)
+        return {"selected": s.get("mic_source") or "", "default": default_src,
+                "clean_mic_present": any(m["clean"] for m in sources),
+                "clean_mic_node": CLEAN_MIC_NODE, "sources": sources}
+
+    async def set_mic_source(self, name):
+        name = (name or "").strip()
+        if name and not _safe_node_name(name):
+            return {"ok": False, "error": "invalid source name"}
+        s = _load()
+        s["mic_source"] = name
+        _save(s)
+        return {"ok": True, "mic_source": name}
 
     async def set_stream_key(self, platform, key):
         s = _load()
@@ -462,11 +551,16 @@ class Plugin:
         if node is None:
             raise RuntimeError(NO_NODE_MSG)
         game_dev, mic_dev = await _resolve_audio(env)
-        decky.logger.info(f"Audio: game={game_dev} mic={mic_dev if s['mic'] else 'off'}")
+        mic_clean = False
+        if s["mic"]:
+            mic_dev, mic_clean, note = await _resolve_mic(env, s, mic_dev)
+            if note:
+                decky.logger.warning(note)
+        decky.logger.info(f"Audio: game={game_dev} mic={(mic_dev or 'default') + (' (Clean Mic)' if mic_clean else '') if s['mic'] else 'off'}")
         proc, mode, enc = await _spawn(env, dict(
             have=ctx["have"], node=node, p=ctx["p"], mic=s["mic"], sink_el="rtmp2sink",
             location=ctx["location"], game_dev=game_dev, mic_dev=mic_dev, game_vol=s["game_vol"],
-            mic_gain=s["mic_gain"], av_offset_ms=s["av_offset"]))
+            mic_gain=s["mic_gain"], av_offset_ms=s["av_offset"], mic_clean=mic_clean))
         decky.logger.info(f"Started ({mode}, encoder {enc}, preset {s['preset']}) -> {ctx['base']}/<redacted>")
         self.proc = proc
         self.health = {"mode": mode}
@@ -593,14 +687,19 @@ class Plugin:
         st = _load()
         p = PRESETS[st["preset"]]
         game_dev, mic_dev = await _resolve_audio(env)
+        mic_clean = False
+        if st["mic"]:
+            mic_dev, mic_clean, note = await _resolve_mic(env, st, mic_dev)
+            if note:
+                out["warnings"].append(note)
         out["game_source"] = game_dev or "@DEFAULT_MONITOR@ (unresolved)"
-        out["mic_source"] = (mic_dev or "default (unresolved)") if st["mic"] else "off"
+        out["mic_source"] = ((mic_dev or "default (unresolved)") + (" (Clean Mic: Deck Live noise filter off)" if mic_clean else "")) if st["mic"] else "off"
         out["av_offset"] = st["av_offset"]
         try:
             proc, mode, enc = await _spawn(env, dict(
                 have=have, node=pick["id"], p=p, mic=st["mic"], sink_el="filesink", location=path,
                 game_dev=game_dev, mic_dev=mic_dev, game_vol=st["game_vol"], mic_gain=st["mic_gain"],
-                meter=True, av_offset_ms=st["av_offset"], _duration=seconds))
+                meter=True, av_offset_ms=st["av_offset"], _duration=seconds, mic_clean=mic_clean))
         except RuntimeError as e:
             out["error"] = str(e)
             return out
