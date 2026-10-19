@@ -20,7 +20,7 @@ While a game is running, the panel shows YouTube help videos for it:
 
 How results are fetched:
 - **YouTube API key (optional):** your own YouTube Data API v3 key, set in *Game Help settings*. It's stored locally (mode 600) and never logged. `search.list` has its own default quota of 100 calls/day per Google project, so Deck Live stops at 90 and switches to no-key mode until midnight PT.
-- **No-key mode:** uses `yt-dlp` (on PATH, or tap *Download yt-dlp* to fetch the official release into the plugin's data folder).
+- **No-key mode:** uses `yt-dlp` when it is already on `PATH`. *Download yt-dlp* fetches the pinned 2026.08.19 zipapp and keeps it only when the SHA256 matches the checksum published with that release. A file that does not match is deleted and never run.
 - **Caching:** results are cached for 7 days per game and topic, so reopening the panel uses no quota. When offline, cached results are shown with an "OFFLINE" badge.
 - **Pinned channel:** defaults to VetTV Handheld (`UCTf3fhasLYzcP4LmSOd6mIw`), whose matching videos show first. Change or clear it in Game Help settings.
 

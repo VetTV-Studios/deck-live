@@ -6,6 +6,7 @@ import {
 } from "@decky/ui";
 import { callable } from "@decky/api";
 import { useEffect, useState } from "react";
+import { resolveSearchGame, type RunningGame } from "./searchGame";
 
 type Item = { id: string; title: string; channel: string; duration?: number | null; views?: number | null; pinned?: boolean };
 type Result = { query?: string; provider: string | null; items: Item[]; cached?: boolean; offline?: boolean;
@@ -25,7 +26,7 @@ const TOPIC_LABELS: Record<string, string> = {
   settings: "Best settings (Legion Go)", next: "What to do next",
 };
 
-export type RunningGame = { appid: string; name: string };
+export type { RunningGame };
 
 /** Current foreground game, or null. Router.MainRunningApp is typed in @decky/ui but undocumented. */
 export function getRunningGame(): RunningGame | null {
@@ -89,19 +90,20 @@ export function GameHelpSection() {
 
   const loadCfg = async () => { const c = await ghGetSettings(); setCfg(c); setPinInput(c.pin_channel); };
 
-  const run = async (t: string, extra = "", refresh = false) => {
-    if (!game) return;
+  const run = async (t: string, extra = "", refresh = false, detected: RunningGame | null = null) => {
+    const target = resolveSearchGame(detected, game);
+    if (!target) return;
     setBusy(true);
-    try { setRes(await ghSearch(game.name, t, extra, refresh)); } finally { setBusy(false); loadCfg(); }
+    try { setRes(await ghSearch(target.name, t, extra, refresh)); } finally { setBusy(false); loadCfg(); }
   };
 
   useEffect(() => {
     loadCfg();
-    const g = getRunningGame();
-    setGame(g);
-    if (g) {
-      run("walkthrough");
-      getLockedAchievements(g.appid).then(setAchs);
+    const detected = getRunningGame();
+    setGame(detected);
+    if (detected) {
+      run("walkthrough", "", false, detected);
+      getLockedAchievements(detected.appid).then(setAchs);
     }
   }, []);
 
@@ -200,7 +202,7 @@ export function GameHelpSection() {
           {!cfg.ytdlp && (
             <PanelSectionRow>
               <ButtonItem layout="below" onClick={async () => { const r = await ghInstallYtdlp(); if (!r.ok) setRes({ provider: null, items: [], error: r.error }); loadCfg(); }}>
-                Download yt-dlp (official GitHub release)
+                Download pinned yt-dlp (checksum verified)
               </ButtonItem>
             </PanelSectionRow>
           )}

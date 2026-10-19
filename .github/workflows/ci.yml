@@ -1,0 +1,46 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Search-target unit test
+        run: node --experimental-strip-types --test tests/search-game.test.ts
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: GStreamer (software encoders only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-gi gir1.2-gstreamer-1.0 \
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
+      - name: Unit tests
+        run: |
+          if [ -d tests ]; then
+            python3 -m unittest discover -s tests -v
+          else
+            echo "no tests/ on this branch"
+          fi
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -S warning install.sh uninstall.sh package.sh

@@ -11,6 +11,7 @@ Network/process work runs off the event loop (threads / niced subprocess) so str
 import asyncio
 import contextlib
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -27,7 +28,12 @@ TTL_S = 7 * 24 * 3600
 QUOTA_GUARD = 90          # hard stop below Google's default 100 search.list calls/day
 MAX_RESULTS = 15
 SHOW = 8
-YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"  # official zipapp
+# Pinned zipapp. SHA256 is the "yt-dlp" line of the release's published SHA2-256SUMS
+# (https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/SHA2-256SUMS).
+# A download that does not match is deleted and never executed. A yt-dlp already on PATH is preferred.
+YTDLP_VERSION = "2026.08.19"
+YTDLP_SHA256 = "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6"
+YTDLP_URL = f"https://github.com/yt-dlp/yt-dlp/releases/download/{YTDLP_VERSION}/yt-dlp"
 
 TOPICS = {
     "walkthrough": "{game} walkthrough",
@@ -93,6 +99,18 @@ class QuotaError(Exception):
 
 class OfflineError(Exception):
     pass
+
+
+class ChecksumError(Exception):
+    pass
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class GameHelp:
@@ -184,16 +202,42 @@ class GameHelp:
                 i["views"] = int(vc) if vc else None
         return items
 
+    def _verified_local(self):
+        """The plugin's own copy, or None unless its bytes match the pinned checksum."""
+        path = self.ytdlp_local
+        if not os.path.isfile(path):
+            return None
+        try:
+            ok = _file_sha256(path) == YTDLP_SHA256
+        except OSError:
+            return None
+        return path if ok else None
+
     def ytdlp_path(self):
-        for p in (shutil.which("yt-dlp"), os.path.expanduser("~/.local/bin/yt-dlp"), self.ytdlp_local):
-            if p and os.path.exists(p):
-                return p
-        return None
+        """Distro/user binary on PATH, else a checksum-verified download. Never an unverified file."""
+        system = shutil.which("yt-dlp")
+        local = self._verified_local()
+        if system:
+            try:
+                if os.path.isfile(self.ytdlp_local) and os.path.samefile(system, self.ytdlp_local):
+                    system = None  # our download is on PATH; it still has to match the pin
+            except OSError:
+                pass
+        if system:
+            return system
+        return local
 
     async def _ytdlp_search(self, q, channel_id=None, n=MAX_RESULTS):
         exe = self.ytdlp_path()
         if not exe:
             raise OfflineError("yt-dlp not installed (Settings: Download yt-dlp, or add a YouTube API key)")
+        if os.path.isfile(self.ytdlp_local):
+            try:
+                same = os.path.samefile(exe, self.ytdlp_local)
+            except OSError:
+                same = False
+            if same and self._verified_local() is None:
+                raise OfflineError("yt-dlp download failed checksum verification and was not run")
         target = (f"https://www.youtube.com/channel/{channel_id}/search?query={urllib.parse.quote(q)}"
                   if channel_id else f"ytsearch{n}:{q}")
         py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else "python3"
@@ -219,15 +263,35 @@ class GameHelp:
         return items
 
     async def install_ytdlp(self):
-        """User-initiated download of the official yt-dlp zipapp into the plugin data dir."""
+        """Download the pinned official zipapp. It is kept only when the SHA256 matches."""
         def dl():
             tmp = self.ytdlp_local + ".part"
             req = urllib.request.Request(YTDLP_URL, headers={"User-Agent": "DeckLive"})
-            with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r, open(tmp, "wb") as f:
-                shutil.copyfileobj(r, f)
-            os.chmod(tmp, 0o755)
-            os.replace(tmp, self.ytdlp_local)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                h = hashlib.sha256()
+                with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r, os.fdopen(fd, "wb") as f:
+                    fd = None
+                    while True:
+                        b = r.read(1 << 16)
+                        if not b:
+                            break
+                        h.update(b)
+                        f.write(b)
+                digest = h.hexdigest()
+                if digest != YTDLP_SHA256:
+                    raise ChecksumError(
+                        f"yt-dlp checksum mismatch (got {digest[:12]}, expected {YTDLP_SHA256[:12]})")
+                os.chmod(tmp, 0o700)
+                os.replace(tmp, self.ytdlp_local)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
         await asyncio.get_event_loop().run_in_executor(None, dl)
+        if self._verified_local() is None:
+            raise ChecksumError("downloaded yt-dlp failed verification and was not kept")
         return self.ytdlp_local
 
     # ---------- public ----------
@@ -235,32 +299,38 @@ class GameHelp:
         q = build_query(game, topic, extra)
         k = q.lower()
         loop = asyncio.get_event_loop()
-        cached = self._cache_get(k)
-        if cached and not refresh and time.time() - cached[0] < TTL_S:
-            res = await self._with_pins(cached[2], game, q, api_key, pin_channel)
-            return self._result(q, cached[1], res, cache=True, ts=cached[0])
+        offline = False
+        # The cache check is inside the lock. Prefetch and the panel both search the same
+        # query; without this, both miss and both spend a search.list unit.
         async with self._lock:
-            provider, items, note = None, None, ""
-            if api_key:
-                try:
-                    items = await loop.run_in_executor(None, self._api_search, api_key, q)
-                    provider = "api"
-                except (QuotaError, OfflineError) as e:
-                    note = str(e)
-                    self.log.warning(f"GameHelp API unavailable: {e}; falling back to yt-dlp")
-            if items is None:
-                try:
-                    items = await self._ytdlp_search(q)
-                    provider = "yt-dlp"
-                except OfflineError as e:
-                    if cached:  # offline: serve stale cache
-                        res = await self._with_pins(cached[2], game, q, api_key, pin_channel)
-                        return self._result(q, cached[1], res, cache=True, ts=cached[0], offline=True,
-                                            note=str(e))
-                    return self._result(q, None, [], error=(note + "; " if note else "") + str(e))
-            self._cache_put(k, provider, items)
-        res = await self._with_pins(items, game, q, api_key, pin_channel)
-        return self._result(q, provider, res, note=note)
+            cached = self._cache_get(k)
+            fresh = bool(cached) and not refresh and time.time() - cached[0] < TTL_S
+            provider, items, note, ts, from_cache = None, None, "", None, False
+            if fresh:
+                provider, items, ts, from_cache = cached[1], cached[2], cached[0], True
+            else:
+                if api_key:
+                    try:
+                        items = await loop.run_in_executor(None, self._api_search, api_key, q)
+                        provider = "api"
+                    except (QuotaError, OfflineError) as e:
+                        note = str(e)
+                        self.log.warning(f"GameHelp API unavailable: {e}; falling back to yt-dlp")
+                if items is None:
+                    try:
+                        items = await self._ytdlp_search(q)
+                        provider = "yt-dlp"
+                    except OfflineError as e:
+                        if cached:  # offline: serve stale cache
+                            provider, items, ts, from_cache = cached[1], cached[2], cached[0], True
+                            offline = True
+                            note = str(e)
+                        else:
+                            return self._result(q, None, [], error=(note + "; " if note else "") + str(e))
+                if items is not None and not from_cache:
+                    self._cache_put(k, provider, items)
+            res = await self._with_pins(items, game, q, api_key, pin_channel)
+        return self._result(q, provider, res, cache=from_cache, ts=ts, offline=offline, note=note)
 
     async def _with_pins(self, items, game, q, api_key, pin_channel):
         """Pinned channel's matching videos first (own query, cached 7 days)."""

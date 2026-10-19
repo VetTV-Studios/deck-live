@@ -259,6 +259,28 @@ async def _stop_proc(proc, timeout=10):
         pass
 
 
+async def _abandon_proc(proc):
+    """Stop a pipeline that is still running. A watcher crash must not leave the encoder up."""
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return
+    try:
+        await _stop_proc(proc, 3)
+    except Exception:
+        pass
+
+
+def _prepare_diag_file(path):
+    """Create an empty regular file. Unlink a symlink; never follow it (filesink would)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.lexists(path):
+        os.unlink(path)  # removes a symlink itself; does not follow it
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    os.close(fd)
+
+
 def _peaks(line):
     vals = []
     for m in re.finditer(r"peak=\((?:double|GValueArray)\)[{<]([^}>]*)[}>]", line):
@@ -384,6 +406,7 @@ class Plugin:
     stop_ev = None
     reconnecting = 0
     stopping = False
+    starting = False
     health = {}
 
     # ---------- settings ----------
@@ -428,41 +451,46 @@ class Plugin:
 
     # ---------- streaming ----------
     async def start_stream(self):
-        if self._live():
+        # Set before the first await. Two Go Live calls on this loop cannot both pass.
+        if self._live() or self.starting:
             return {"ok": False, "error": "Already live"}
-        self.last_error = ""
-        self.stopping = False
-        s = _load()
-        plat = s["platform"] if s["platform"] in ENABLED_PLATFORMS else ENABLED_PLATFORMS[0]
-        key = s["keys"].get(plat, "")
-        base = PLATFORMS[plat]["url"] or s["custom_urls"].get(plat, "")
-        if not base:
-            return self._fail("No ingest URL set for this platform")
-        if not key and plat not in ("custom", "rumble"):
-            return self._fail("No stream key set")
-        env = _user_env()
-        if not shutil.which("gst-launch-1.0"):
-            return self._fail("gst-launch-1.0 not found on this system")
-        p = dict(PRESETS[s["preset"]], kbps=_effective_kbps(plat, s["preset"]))
-        decky.logger.info(f"Video bitrate {p['kbps']} kbps CBR ({plat}/{s['preset']})")
-        have = await _available(env)
-        if not have.get("rtmp2sink"):
-            return self._fail("rtmp2sink missing (gstreamer1-plugins-bad)")
-        node = await _find_gamescope_node(env)
-        if node is None:
-            return self._fail(NO_NODE_MSG)
-        location = base.rstrip("/") + ("/" + key if key else "")
-        ctx = {"env": env, "have": have, "s": s, "p": p, "location": location, "base": base, "key": key}
+        self.starting = True
         try:
-            proc, mode = await self._launch(ctx)
-        except RuntimeError as e:
-            return self._fail(str(e))
-        self.started_at = time.time()  # kept across reconnects
-        self.reconnecting = 0
-        self.stop_ev = asyncio.Event()
-        self.session = asyncio.get_event_loop().create_task(self._session(proc, mode, ctx))
-        await self._emit_status()
-        return {"ok": True}
+            self.last_error = ""
+            self.stopping = False
+            s = _load()
+            plat = s["platform"] if s["platform"] in ENABLED_PLATFORMS else ENABLED_PLATFORMS[0]
+            key = s["keys"].get(plat, "")
+            base = PLATFORMS[plat]["url"] or s["custom_urls"].get(plat, "")
+            if not base:
+                return self._fail("No ingest URL set for this platform")
+            if not key and plat not in ("custom", "rumble"):
+                return self._fail("No stream key set")
+            env = _user_env()
+            if not shutil.which("gst-launch-1.0"):
+                return self._fail("gst-launch-1.0 not found on this system")
+            p = dict(PRESETS[s["preset"]], kbps=_effective_kbps(plat, s["preset"]))
+            decky.logger.info(f"Video bitrate {p['kbps']} kbps CBR ({plat}/{s['preset']})")
+            have = await _available(env)
+            if not have.get("rtmp2sink"):
+                return self._fail("rtmp2sink missing (gstreamer1-plugins-bad)")
+            node = await _find_gamescope_node(env)
+            if node is None:
+                return self._fail(NO_NODE_MSG)
+            location = base.rstrip("/") + ("/" + key if key else "")
+            ctx = {"env": env, "have": have, "s": s, "p": p, "location": location, "base": base, "key": key}
+            try:
+                proc, mode = await self._launch(ctx)
+            except RuntimeError as e:
+                return self._fail(str(e))
+            self.started_at = time.time()  # kept across reconnects
+            self.reconnecting = 0
+            self.stop_ev = asyncio.Event()
+            self.session = asyncio.get_event_loop().create_task(self._session(proc, mode, ctx))
+            await self._emit_status()
+            return {"ok": True}
+        finally:
+            self.starting = False
 
     async def _launch(self, ctx):
         """(Re)resolve capture node + audio and spawn the pipeline. Raises RuntimeError."""
@@ -494,10 +522,22 @@ class Plugin:
             while True:
                 t0 = time.time()
                 if proc is not None:
-                    rc, msg = await self._watch(proc, ctx["key"], mode)
-                    if self.stopping:
-                        break
-                    self.last_error = msg or f"Pipeline exited ({rc})"
+                    try:
+                        rc, msg = await self._watch(proc, ctx["key"], mode)
+                    except Exception as e:
+                        # readline can raise LimitOverrunError. Kill the child before dropping
+                        # the reference, or the panel shows Offline while the encoder keeps running.
+                        await _abandon_proc(proc)
+                        proc = None
+                        self.proc = None
+                        if self.stopping:
+                            break
+                        self.last_error = _redact(str(e), ctx.get("key"))[:300]
+                        decky.logger.exception("Stream watcher failed")
+                    else:
+                        if self.stopping:
+                            break
+                        self.last_error = msg or f"Pipeline exited ({rc})"
                 if time.time() - t0 > 60:  # it had been streaming fine: fresh backoff budget
                     attempts, outage_start = 0, None
                 outage_start = outage_start or time.time()
@@ -525,6 +565,9 @@ class Plugin:
                     proc = None
                     self.last_error = _redact(str(e), ctx["key"])[:300]
         finally:
+            await _abandon_proc(proc)
+            if self.proc is not proc:
+                await _abandon_proc(self.proc)
             self.proc = None
             self.reconnecting = 0
             self.started_at = None
@@ -541,39 +584,52 @@ class Plugin:
         errtask = asyncio.ensure_future(proc.stderr.read())
         last_log = 0
         worker_err = ""
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode(errors="replace").strip()
-            if mode != "worker" or not text.startswith("{"):
-                continue
-            try:
-                msg = json.loads(text)
-            except ValueError:
-                continue
-            if "stats" in msg:
-                self.health = {"mode": mode, **msg["stats"]}
-                await decky.emit("stream_health", self.health)
-                if time.time() - last_log >= 10:
-                    last_log = time.time()
-                    decky.logger.info(f"Health: {json.dumps(self.health)}")
-            elif "error" in msg:
-                worker_err = msg["error"]
-        err = (await errtask).decode(errors="replace").strip()
-        rc = await proc.wait()
-        msg = worker_err or (err.splitlines()[-1] if err else "")
-        msg, err = _redact(msg, key), _redact(err, key)
-        if self.stopping:
-            decky.logger.info(f"Stream stopped by user (rc={rc})")
-        else:
-            decky.logger.error(f"Pipeline exited rc={rc}: {err[-2000:]}")
-        return rc, msg[:300]
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace").strip()
+                if mode != "worker" or not text.startswith("{"):
+                    continue
+                try:
+                    msg = json.loads(text)
+                except ValueError:
+                    continue
+                if "stats" in msg:
+                    self.health = {"mode": mode, **msg["stats"]}
+                    await decky.emit("stream_health", self.health)
+                    if time.time() - last_log >= 10:
+                        last_log = time.time()
+                        decky.logger.info(f"Health: {json.dumps(self.health)}")
+                elif "error" in msg:
+                    worker_err = msg["error"]
+            err = (await errtask).decode(errors="replace").strip()
+            rc = await proc.wait()
+            msg = worker_err or (err.splitlines()[-1] if err else "")
+            msg, err = _redact(msg, key), _redact(err, key)
+            if self.stopping:
+                decky.logger.info(f"Stream stopped by user (rc={rc})")
+            else:
+                decky.logger.error(f"Pipeline exited rc={rc}: {err[-2000:]}")
+            return rc, msg[:300]
+        finally:
+            if not errtask.done():
+                errtask.cancel()
+                try:
+                    await errtask
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def get_health(self):
         return self.health if self._live() else {}
 
     async def run_diagnostics(self, seconds=20):
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            seconds = 20
+        seconds = max(5, min(30, seconds))
         if self._live():
             return {"ok": False, "error": "Stop the stream before running diagnostics"}
         env = _user_env()
@@ -595,10 +651,12 @@ class Plugin:
             return out
         out["node"] = f"{pick['id']} ({pick['name']})"
         home = getattr(decky, "DECKY_USER_HOME", os.path.expanduser("~"))
-        os.makedirs(os.path.join(home, "Videos"), exist_ok=True)
         path = os.path.join(home, "Videos", "decky-live-test.flv")
-        if os.path.exists(path):
-            os.remove(path)
+        try:
+            _prepare_diag_file(path)
+        except OSError as e:
+            out["error"] = f"Could not prepare the test file: {e}"
+            return out
         st = _load()
         p = PRESETS[st["preset"]]
         game_dev, mic_dev = await _resolve_audio(env)
