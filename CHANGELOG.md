@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (fix/stream-key-leak)
+## 1.0.2 — 2026-10-18
 - Security: Go Live no longer falls back to `gst-launch-1.0` when PyGObject is missing. That fallback put the RTMP URL with the stream key on the command line, readable by any local process through `/proc/<pid>/cmdline`. Streaming now refuses to start with a clear message (install `python3-gobject` or update Bazzite/SteamOS). Diagnostics, which only writes a local file, can still use gst-launch.
 - A failed PyGObject check is no longer cached, so installing `python3-gobject` works after a reload instead of a Decky restart.
 - Logs and error messages redact the stream key (raw and percent-encoded) and any `rtmp://` / `rtmps://` URL.
