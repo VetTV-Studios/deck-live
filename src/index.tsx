@@ -5,6 +5,7 @@ import {
 import { addEventListener, removeEventListener, callable, definePlugin, toaster } from "@decky/api";
 import { useEffect, useState } from "react";
 import { FaBroadcastTower } from "react-icons/fa";
+import { GameHelpSection, registerGameHelpPrefetch } from "./gamehelp";
 
 type Platform = { id: string; label: string; needs_url: boolean };
 type State = {
@@ -105,6 +106,7 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
+      <GameHelpSection />
       <PanelSection title="Destination">
         <PanelSectionRow>
           <DropdownItem label="Platform" disabled={st.live}
@@ -201,10 +203,13 @@ function Content() {
   );
 }
 
-export default definePlugin(() => ({
+export default definePlugin(() => {
+  const unregisterPrefetch = registerGameHelpPrefetch();
+  return {
   name: "Deck Live",
   titleView: <div className={staticClasses.Title}>Deck Live</div>,
   content: <Content />,
   icon: <FaBroadcastTower />,
-  onDismount() {},
-}));
+  onDismount() { unregisterPrefetch(); },
+  };
+});
