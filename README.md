@@ -16,7 +16,7 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 - Decky Loader (API v1) in Game Mode (gamescope exposes the PipeWire video node `gamescope`).
 - PipeWire with pipewire-pulse (`pactl`, `pw-dump`).
 - GStreamer (tested with 1.28; 1.20+ likely needed for the `va` plugin) with `gst-launch-1.0`, `gst-inspect-1.0` and these elements: `pipewiresrc`, `pulsesrc`, `vapostproc`, `vah264enc` (or one of the fallback encoders), `h264parse`, `videorate`, `avenc_aac` (or `fdkaacenc`), `flvmux`, `rtmp2sink`. `level` and `webrtcdsp` are optional.
-- Recommended: system `python3` with PyGObject (`gi`) and GStreamer typelibs. It enables the in-process runner with health stats and clean EOS handling. Without it the plugin falls back to `gst-launch-1.0` (no health stats).
+- Required for streaming: system `python3` with PyGObject (`gi`, package `python3-gobject`) and the GStreamer typelibs. The worker reads the pipeline, including the stream key, from stdin, so the key never appears on a command line. Without PyGObject, Go Live refuses to start and says so; only local Diagnostics may fall back to `gst-launch-1.0` (no health stats).
 
 ## Tested devices
 | Device | OS | Result |
@@ -59,7 +59,7 @@ Not listed in the Decky Plugin Store.
     ./package.sh        # -> ../deck-live.zip (zip of dist/, main.py, gst_worker.py, plugin.json, package.json, LICENSE, README)
 
 ## How it works
-`main.py` (the Decky backend) builds a GStreamer pipeline and runs it in `gst_worker.py` (system python3 + PyGObject), falling back to `gst-launch-1.0`:
+`main.py` (the Decky backend) builds a GStreamer pipeline and runs it in `gst_worker.py` (system python3 + PyGObject). Streaming never falls back to `gst-launch-1.0`, because that would expose the stream key in the process list:
 
     pipewiresrc(gamescope, always-copy) → leaky queue → vapostproc (GPU scale, add-borders)
       → videorate (CFR) → vah264enc (CBR, 2 s GOP, no B-frames) → h264parse → [video delay = −A/V offset]
