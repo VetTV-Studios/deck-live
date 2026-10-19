@@ -16,6 +16,11 @@ try:
 except Exception as _e:  # never let the add-on break streaming
     gamehelp = None
     decky.logger.error(f"Game Help unavailable: {_e}")
+try:
+    import chatcore
+except Exception as _e:  # chat is optional; streaming still works
+    chatcore = None
+    decky.logger.error(f"Chat core unavailable: {_e}")
 
 SETTINGS_PATH = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
 
@@ -48,7 +53,8 @@ PRESETS = {
 
 DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain": 50, "game_vol": 100, "av_offset": -160,
             "keys": {}, "custom_urls": {},
-            "gh_api_key": "", "gh_pin_channel": "UCTf3fhasLYzcP4LmSOd6mIw", "gh_enabled": True}
+            "gh_api_key": "", "gh_pin_channel": "UCTf3fhasLYzcP4LmSOd6mIw", "gh_enabled": True,
+            "chat_platform": "twitch", "chat_channel": "", "chat_yt_key": "", "chat_oauth": "", "chat_login": ""}
 
 
 def _load():
@@ -823,12 +829,118 @@ class Plugin:
         except Exception as e:
             return {"ok": False, "error": str(e)[:300]}
 
+    # ---------- shared chat core ----------
+    _chat = None
+
+    def _chatcore(self):
+        if chatcore is None:
+            raise RuntimeError("Chat core module failed to load")
+        if self._chat is None:
+            self._chat = chatcore.ChatCore(decky.logger)
+            self._chat.bus.subscribe(self._on_chat_event)
+        return self._chat
+
+    def _on_chat_event(self, event):
+        emit = getattr(decky, "emit", None)
+        if emit is None:
+            return
+        try:
+            asyncio.get_running_loop().create_task(emit("chat_event", event))
+        except RuntimeError:
+            pass
+
+    def _chat_unavailable(self):
+        return {"state": "error", "platform": "twitch", "channel": "", "detail": "Chat core failed to load",
+                "messages": [], "poll": None, "overlay_url": "", "has_yt_key": False, "has_oauth": False,
+                "has_login": False, "quota_used": 0, "dropped": 0}
+
+    async def chat_get_state(self):
+        if chatcore is None:
+            return self._chat_unavailable()
+        s = _load()
+        core = self._chatcore()
+        await core.ensure_overlay()
+        snap = core.snapshot()
+        if core.state == "offline":
+            snap["platform"] = s.get("chat_platform") or snap["platform"] or "twitch"
+            snap["channel"] = snap["channel"] or s.get("chat_channel", "")
+        # Flags come from the settings file. The token and key themselves never leave it.
+        snap["has_yt_key"] = bool(s.get("chat_yt_key"))
+        snap["has_oauth"] = bool(s.get("chat_oauth"))
+        snap["has_login"] = bool(s.get("chat_login"))
+        return snap
+
+    async def chat_set_yt_key(self, key):
+        key = (key or "").strip()
+        if not key:
+            return True  # an empty field must not wipe a saved key
+        s = _load()
+        s["chat_yt_key"] = key
+        _save(s)
+        if self._chat is not None:
+            self._chat.yt_key = key
+        decky.logger.info("Chat YouTube key set")
+        return True
+
+    async def chat_set_oauth(self, token, login=""):
+        token = (token or "").strip()
+        login = (login or "").strip()
+        if not token and not login:
+            return True
+        s = _load()
+        if token:
+            s["chat_oauth"] = token
+        if login:
+            s["chat_login"] = login
+        _save(s)
+        if self._chat is not None:
+            self._chat.oauth = s["chat_oauth"]
+            self._chat.login = s["chat_login"]
+        decky.logger.info("Chat OAuth updated")
+        return True
+
+    async def chat_connect(self, platform, channel):
+        if chatcore is None:
+            return {"ok": False, "error": "Chat core failed to load"}
+        s = _load()
+        s["chat_platform"] = (platform or "").strip().lower()
+        s["chat_channel"] = (channel or "").strip()
+        _save(s)
+        core = self._chatcore()
+        await core.ensure_overlay()
+        return await core.connect(s["chat_platform"], s["chat_channel"], s.get("chat_yt_key", ""),
+                                  s.get("chat_oauth", ""), s.get("chat_login", ""))
+
+    async def chat_disconnect(self):
+        if self._chat is not None:
+            await self._chat.disconnect()
+        return True
+
+    async def chat_start_poll(self, spec=""):
+        if chatcore is None:
+            return None
+        return self._chatcore().start_poll(spec or "")
+
+    async def chat_stop_poll(self):
+        if self._chat is None:
+            return None
+        return self._chat.stop_poll()
+
+    async def chat_send(self, text):
+        if self._chat is None:
+            return {"ok": False, "error": "Chat is not connected"}
+        return await self._chat.send(text)
+
     async def _main(self):
         decky.logger.info("Deck Live loaded")
 
     async def _unload(self):
         await self.stop_stream()
+        if self._chat is not None:
+            await self._chat.close()
         decky.logger.info("Deck Live unloaded")
 
     async def _uninstall(self):
         await self.stop_stream()
+        if self._chat is not None:
+            await self._chat.close()

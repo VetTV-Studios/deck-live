@@ -24,6 +24,13 @@ How results are fetched:
 - **Caching:** results are cached for 7 days per game and topic, so reopening the panel uses no quota. When offline, cached results are shown with an "OFFLINE" badge.
 - **Pinned channel:** defaults to VetTV Handheld (`UCTf3fhasLYzcP4LmSOd6mIw`), whose matching videos show first. Change or clear it in Game Help settings.
 
+## Chat core (preview, branch `feature/chat-core`)
+One reader for the later YouTube hub, Crowd Choice, and Crowd Play:
+- **Twitch:** anonymous IRC over `wss://irc-ws.chat.twitch.tv` (`justinfan`). A Twitch login plus OAuth token is optional and is what lets the plugin send. The token is not logged.
+- **YouTube:** `liveChatMessages` with a user API key (`X-Goog-Api-Key`) or OAuth bearer. Polling waits at least `pollingIntervalMillis` (never under 1 s) and pauses for the day at 9000 quota units.
+- **Polls:** `!1` / `!2`, or comma-separated keywords. One vote per user; the first choice sticks.
+- **OBS:** the panel shows a `http://127.0.0.1:<port>/` page. Add it as a browser source. It is bound to loopback and does not load remote scripts.
+
 ## Requirements
 - Decky Loader (API v1) in Game Mode (gamescope exposes the PipeWire video node `gamescope`).
 - PipeWire with pipewire-pulse (`pactl`, `pw-dump`).
