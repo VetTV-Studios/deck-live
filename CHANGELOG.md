@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased (fix/stream-key-leak)
+- Security: Go Live no longer falls back to `gst-launch-1.0` when PyGObject is missing. That fallback put the RTMP URL with the stream key on the command line, readable by any local process through `/proc/<pid>/cmdline`. Streaming now refuses to start with a clear message (install `python3-gobject` or update Bazzite/SteamOS). Diagnostics, which only writes a local file, can still use gst-launch.
+- A failed PyGObject check is no longer cached, so installing `python3-gobject` works after a reload instead of a Decky restart.
+- Logs and error messages redact the stream key (raw and percent-encoded) and any `rtmp://` / `rtmps://` URL.
+- `settings.json` (stream keys) is now created with mode 0600 from the start, fsync'd, and its folder is 0700. A file left 0644 by an older build is tightened on load.
+
 ## Unreleased (feature/encoder-fallback)
 - Encoder fallback chain: VA-API, then NVENC (nvh264enc/nvautogpuh264enc, CUDA upload and scale), then x264, then openh264. Each encoder is checked with a test encode before use.
 - Encoder setting (Auto/VA-API/NVENC/Software). Auto prefers NVENC when the display runs on an NVIDIA GPU.
