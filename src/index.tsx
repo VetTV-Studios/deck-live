@@ -8,7 +8,7 @@ import { FaBroadcastTower } from "react-icons/fa";
 
 type Platform = { id: string; label: string; needs_url: boolean };
 type State = {
-  platforms: Platform[]; presets: string[]; bitrates: Record<string, Record<string, number>>; platform: string; preset: string; mic: boolean; mic_gain: number; game_vol: number; av_offset: number; encoder: string; encoder_prefs: string[];
+  platforms: Platform[]; presets: string[]; bitrates: Record<string, Record<string, number>>; platform: string; preset: string; mic: boolean; mic_gain: number; game_vol: number; av_offset: number; encoder: string; encoder_prefs: string[]; light_defaults?: boolean; vram_total_mib?: number | null;
   has_key: Record<string, boolean>; custom_urls: Record<string, string>;
   live: boolean; started_at: number | null; error: string; reconnecting?: number;
 };
@@ -133,6 +133,8 @@ function Content() {
       <PanelSection title="Quality">
         <PanelSectionRow>
           <DropdownItem label="Preset" disabled={st.live}
+            description={st.light_defaults && st.preset === "720p30"
+              ? `${st.vram_total_mib} MB GPU detected: lighter 720p30 default to save VRAM. Pick a preset to override.` : undefined}
             rgOptions={st.presets.map((p) => ({ data: p, label: p }))}
             selectedOption={st.preset} onChange={(o) => update({ preset: o.data })} />
         </PanelSectionRow>
@@ -151,7 +153,7 @@ function Content() {
         </PanelSectionRow>
         <PanelSectionRow>
           <DropdownItem label="Encoder" disabled={st.live}
-            description="Auto: VA-API, or NVENC when the display runs on an NVIDIA GPU; falls back to the next working encoder"
+            description="Auto: VA-API, or NVENC when the display runs on an NVIDIA GPU; tested at Go Live, falls back to the next working encoder. VA-API/NVENC/Software use only that encoder."
             rgOptions={(st.encoder_prefs ?? ["auto"]).map((e) => ({ data: e,
               label: ({ auto: "Auto", vaapi: "VA-API", nvenc: "NVENC", software: "Software" } as Record<string, string>)[e] ?? e }))}
             selectedOption={st.encoder ?? "auto"} onChange={(o) => update({ encoder: o.data })} />

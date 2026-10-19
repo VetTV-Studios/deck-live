@@ -119,11 +119,26 @@ def _user_env():
     return env
 
 
-async def _run(cmd, env):
+async def _run(cmd, env, timeout=None):
     p = await asyncio.create_subprocess_shell(cmd, env=env, stdout=asyncio.subprocess.PIPE,
-                                              stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await p.communicate()
+                                              stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+    try:
+        out, _ = await asyncio.wait_for(p.communicate(), timeout)
+    except asyncio.TimeoutError:
+        _kill_group(p)
+        await p.wait()
+        return ""
     return out.decode(errors="replace")
+
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, 9)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 async def _pw_video_nodes(env):
@@ -180,8 +195,21 @@ async def _resolve_audio(env):
     return game, src
 
 
-async def _has_element(name, env):
-    return bool(await _run(f"gst-inspect-1.0 {shlex.quote(name)}", env))
+async def _has_element(name, env, min_version=None):
+    """Registry lookup (`gst-inspect-1.0 --exists`). Unlike a full gst-inspect, this does not load
+    the plugin, so checking nvcodec/va elements does not open a CUDA context or a VA display."""
+    args = ["gst-inspect-1.0", "--exists"] + ([f"--atleast-version={min_version}"] if min_version else []) + [name]
+    try:
+        p = await asyncio.create_subprocess_exec(*args, env=env, stdout=asyncio.subprocess.DEVNULL,
+                                                 stderr=asyncio.subprocess.DEVNULL)
+    except OSError:
+        return False
+    try:
+        return await asyncio.wait_for(p.wait(), 15) == 0
+    except asyncio.TimeoutError:
+        p.kill()
+        await p.wait()
+        return False
 
 
 ELEMENTS = ["pipewiresrc", "pulsesrc", "vapostproc", "vah264enc", "vaapih264enc", "openh264enc",
@@ -191,7 +219,12 @@ ELEMENTS = ["pipewiresrc", "pulsesrc", "vapostproc", "vah264enc", "vaapih264enc"
 
 async def _available(env):
     res = await asyncio.gather(*[_has_element(e, env) for e in ELEMENTS])
-    return dict(zip(ELEMENTS, res))
+    have = dict(zip(ELEMENTS, res))
+    if have.get("nvh264enc"):
+        # 1.22+ nvh264enc is GstNvEncoder (preset=p1..p7, tune=...). Older GstNvBaseEnc only knows
+        # preset=hp/hq/low-latency-hq and has no tune/repeat-sequence-header.
+        have["nvenc_new"] = await _has_element("nvh264enc", env, "1.22")
+    return have
 
 
 # ---------- encoder selection ----------
@@ -205,22 +238,45 @@ _VENDORS = {"0x10de": "nvidia", "0x8086": "intel", "0x1002": "amd"}
 
 
 def encoder_order(pref, display_gpu=None):
-    """Candidate encoders, best first. A forced family is tried first, then the normal chain
-    (except 'software', which never silently switches to hardware)."""
+    """Candidate encoders, best first. An explicit family is the only thing probed (so Software never
+    opens the GPU and VA-API never opens CUDA); Auto walks the full chain and stops at the first
+    encoder that works."""
     if pref == "software":
         return list(SW_ENCS)
-    if pref == "nvenc" or (pref == "auto" and display_gpu == "nvidia"):
+    if pref == "vaapi":
+        return list(VAAPI_ENCS)
+    if pref == "nvenc":
+        return list(NVENC_ENCS)
+    if display_gpu == "nvidia":
         return NVENC_ENCS + VAAPI_ENCS + SW_ENCS
     return VAAPI_ENCS + NVENC_ENCS + SW_ENCS
+
+
+def fallback_order(pref, display_gpu=None, bad=()):
+    """Order after an encoder failed while live: the chosen family, then the rest of the Auto
+    chain (hardware -> x264). Software never promotes to hardware."""
+    order = encoder_order(pref, display_gpu)
+    if pref != "software":
+        order += [e for e in encoder_order("auto", display_gpu) if e not in order]
+    return [e for e in order if e not in bad]
+
+
+class NoEncoderError(RuntimeError):
+    pass
+
+
+def _no_encoder_msg(pref, tried):
+    hint = {"nvenc": " NVENC isn't usable right now; pick Auto or Software.",
+            "vaapi": " VA-API isn't usable here; pick Auto or Software."}.get(pref, "")
+    return (f"No working H.264 encoder (tried {tried or 'none'}).{hint} Run Diagnostics; install "
+            "gstreamer1-plugins-bad (VA/NVENC) or x264/openh264.")
 
 
 def pick_encoder(pref, display_gpu, works):
     for e in encoder_order(pref, display_gpu):
         if works.get(e):
             return e
-    tried = ", ".join(encoder_order(pref, display_gpu))
-    raise RuntimeError(f"No working H.264 encoder (tried {tried}). Run Diagnostics; install "
-                       "gstreamer1-plugins-bad (VA/NVENC) or x264/openh264.")
+    raise NoEncoderError(_no_encoder_msg(pref, ", ".join(encoder_order(pref, display_gpu))))
 
 
 def gpu_info(drm="/sys/class/drm", proc="/proc"):
@@ -274,36 +330,147 @@ def gpu_info(drm="/sys/class/drm", proc="/proc"):
     return {"gpus": gpus, "display_gpu": display, "nvidia": nvidia, "source": source}
 
 
-PROBE_PIPE = ("videotestsrc num-buffers=15 ! video/x-raw,width=640,height=360,framerate=30/1 ! "
-              "videoconvert ! {enc} ! fakesink")
-_probe_cache = None
+# ---------- VRAM ----------
+LOW_VRAM_MIB = 4096          # 4 GB-class cards (RTX 3050 4GB): Steam already OOM'd here
+MIN_FREE_VRAM_MIB = 512      # don't open an NVENC/CUDA session below this
+LIGHT_PRESET = "720p30"      # light default on low-VRAM GPUs (1280x720, 30 fps, 4500 kbps)
+_vram_total = None
 
 
-async def probe_encoders(env, have, force=False):
-    """{encoder: {'present': bool, 'works': bool, 'error': str}}. 'present' = factory registered,
-    'works' = a 15-frame test encode reached EOS (nvcodec/VA can register yet fail to open)."""
-    global _probe_cache
-    if _probe_cache is not None and not force:
-        return _probe_cache
-    names = VAAPI_ENCS + NVENC_ENCS + SW_ENCS
-    res = None
-    if await _gi_available(env):
-        out = await _run(f"{SYS_PY} {shlex.quote(WORKER)} --probe " + " ".join(names), env)
-        try:
-            res = json.loads(out.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            res = None
-    if res is None:  # gst-launch fallback
-        res = {}
-        for e in names:
-            if not have.get(e):
-                res[e] = {"present": False, "works": False, "error": "not installed"}
-                continue
-            out = await _run(f"timeout 10 gst-launch-1.0 -q {PROBE_PIPE.format(enc=e)} >/dev/null 2>&1 && echo OK", env)
-            res[e] = {"present": True, "works": "OK" in out, "error": "" if "OK" in out else "test encode failed"}
-    _probe_cache = res
-    decky.logger.info("Encoder probe: " + json.dumps({k: v["works"] for k, v in res.items()}))
+async def _vram_mib(env=None):
+    """(free, total) MiB of the first NVIDIA GPU from nvidia-smi (NVML, no CUDA context), or (None, None)."""
+    global _vram_total
+    if not shutil.which("nvidia-smi"):
+        return None, None
+    try:
+        out = await _run("nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits",
+                         env if env is not None else _user_env(), timeout=3)
+        free_s, total_s = out.strip().splitlines()[0].split(",")[:2]
+        free, total = int(float(free_s)), int(float(total_s))
+    except Exception:  # missing/odd nvidia-smi must never break get_state or Go Live
+        return None, None
+    _vram_total = total
+    return free, total
+
+
+async def _vram_total_mib(env=None):
+    if _vram_total is None:
+        await _vram_mib(env)
+    return _vram_total
+
+
+def low_vram(total_mib):
+    return total_mib is not None and 0 < total_mib <= LOW_VRAM_MIB
+
+
+def effective_preset(s, total_mib):
+    """User's preset, or the light preset on a <=4 GB GPU until the user picks one themselves."""
+    if low_vram(total_mib) and not s.get("preset_set"):
+        return LIGHT_PRESET
+    return s["preset"] if s.get("preset") in PRESETS else DEFAULTS["preset"]
+
+
+# ---------- encoder probe ----------
+PROBE_FRAMES = 10
+PROBE_TIMEOUT_S = 8
+_probe_cache = {}  # (encoder, w, h, fps, nvenc_new) -> {"present", "works", "error"}
+
+
+def _probe_key(have, enc, p):
+    return (enc, p["w"], p["h"], p["fps"], bool(have.get("nvenc_new", True)) if enc in NVENC_ENCS else None)
+
+
+def _probe_pipeline(have, enc, p, shell=False):
+    """Short test encode with the *same* upload/scale chain and encoder properties as the real
+    pipeline, at the real stream resolution and fps, so a probe pass means the broadcast string
+    parses and the device opens at that size."""
+    _, conv, venc, prof = _video_chain(have, p, enc, shell)
+    caps = f"video/x-h264,profile={prof}" if prof else "video/x-h264"
+    src = f"videotestsrc num-buffers={PROBE_FRAMES} ! video/x-raw,width={p['w']},height={p['h']},framerate={p['fps']}/1"
+    return f"{src} ! {conv} ! {venc} ! h264parse ! {caps} ! fakesink sync=false"
+
+
+async def _probe_one(env, have, enc, p, force=False):
+    """Probe one encoder at preset p. One short-lived process per probe: the pipeline is set to
+    NULL and released inside it, and the process exit frees any CUDA/VA context for certain."""
+    k = _probe_key(have, enc, p)
+    if not force and k in _probe_cache:
+        return _probe_cache[k]
+    if not have.get(enc):
+        res = {"present": False, "works": False, "error": "not installed"}
+        _probe_cache[k] = res
+        return res
+    if ENC_FAMILY.get(enc) == "nvenc":
+        free, _ = await _vram_mib(env)
+        if free is not None and free < MIN_FREE_VRAM_MIB:  # transient: not cached
+            return {"present": True, "works": False,
+                    "error": f"only {free} MiB GPU memory free (need {MIN_FREE_VRAM_MIB})"}
+    try:
+        gi = await _gi_available(env)
+        pipe = _probe_pipeline(have, enc, p, shell=not gi)
+    except RuntimeError as e:
+        res = {"present": True, "works": False, "error": str(e)[:200]}
+        _probe_cache[k] = res
+        return res
+    if gi:
+        res = await _probe_worker(env, pipe)
+    else:  # no key in a probe, so gst-launch is fine here
+        out = await _run(f"timeout -k 2 {PROBE_TIMEOUT_S} gst-launch-1.0 -q {pipe} >/dev/null 2>&1 && echo OK",
+                         env, timeout=PROBE_TIMEOUT_S + 5)
+        res = {"works": "OK" in out, "error": "" if "OK" in out else "test encode failed"}
+    res = {"present": True, "works": bool(res.get("works")), "error": str(res.get("error") or "")[:200]}
+    _probe_cache[k] = res
+    decky.logger.info(f"Encoder probe {enc} {p['w']}x{p['h']}@{p['fps']}: "
+                      + ("ok" if res["works"] else f"failed ({res['error']})"))
     return res
+
+
+async def _probe_worker(env, pipe):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            SYS_PY, WORKER, "--probe", env=env, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return {"works": False, "error": str(e)}
+    try:
+        out, _ = await asyncio.wait_for(
+            proc.communicate(json.dumps({"pipeline": pipe, "timeout": PROBE_TIMEOUT_S}).encode()),
+            PROBE_TIMEOUT_S + 5)
+    except asyncio.TimeoutError:
+        _kill_group(proc)
+        await proc.wait()
+        return {"works": False, "error": "probe timed out"}
+    try:
+        return json.loads(out.decode(errors="replace").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"works": False, "error": f"probe crashed (rc={proc.returncode})"}
+
+
+async def probe_encoders(env, have, p, names, force=False):
+    """Probe each name in order (no early stop). For Diagnostics/tests; Go Live uses _choose."""
+    return {e: await _probe_one(env, have, e, p, force) for e in names}
+
+
+def probe_snapshot(p=None):
+    """Cached probe results, optionally only for preset p. Never opens a device."""
+    return {f"{k[0]} {k[1]}x{k[2]}@{k[3]}": v for k, v in _probe_cache.items()
+            if p is None or k[1:4] == (p["w"], p["h"], p["fps"])}
+
+
+_ENC_FAULT_RE = re.compile(r"\bvenc\b|cuda|nvenc|nvcodec|nvh264|nvautogpu|out of memory|memory|\bvaapi|"
+                           r"vapostproc|\bva\b|negotiat|no property|encod", re.I)
+
+
+def is_encoder_fault(enc, msg, ran_s, health=None):
+    """Did a live hardware pipeline die because of the encoder/GPU (not the network)?"""
+    if ENC_FAMILY.get(enc) not in ("nvenc", "vaapi"):
+        return False
+    msg = msg or ""
+    if msg.startswith("out:"):  # rtmp2sink (named "out"): network/ingest problem
+        return False
+    if _ENC_FAULT_RE.search(msg):
+        return True
+    return ran_s < 15 and not (health or {}).get("vframes")
 
 
 RECONNECT_DELAYS = [2, 5, 10, 20, 30]  # then 30 s repeatedly
@@ -378,12 +545,8 @@ NO_NODE_MSG = ("Gamescope capture not found. Open this from Game Mode (not Deskt
                "if you are in Game Mode, run Diagnostics and share the result.")
 
 
-def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_dev=None,
-                    game_vol=100, mic_gain=50, meter=False, av_offset_ms=0, shell=True, encoder=None):
-    """Return (pipeline string, encoder name) or raise RuntimeError.
-    shell=True -> quoted for /bin/sh + gst-launch; False -> for Gst.parse_launch (worker)."""
-    def qv(v):  # quote a property value
-        return shlex.quote(v) if shell else '"' + v.replace('"', '\\"') + '"'
+def _video_chain(have, p, encoder=None, shell=True):
+    """(encoder, convert/scale chain, encoder element string, h264 profile) for preset p."""
     def qc(c):  # quote caps containing ()
         return f"'{c}'" if shell else c
     gop = p["fps"] * 2  # ~2 s keyframe interval for YouTube/Twitch
@@ -421,8 +584,12 @@ def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_de
         else:  # nvh264enc also accepts system-memory NV12 (uploads internally)
             conv = (f"videoconvert ! videoscale add-borders=true ! video/x-raw,width={W},height={H},format=NV12 ! "
                     f"videorate name=vrate drop-only=false skip-to-first=true ! video/x-raw,framerate={F}/1")
-        venc = (f"{encoder} name=venc rc-mode=cbr bitrate={k} vbv-buffer-size={k} gop-size={gop} bframes=0 "
-                f"preset=p4 tune=low-latency zerolatency=true repeat-sequence-header=true")
+        if encoder == "nvautogpuh264enc" or have.get("nvenc_new", True):  # GstNvEncoder (1.22+)
+            venc = (f"{encoder} name=venc rc-mode=cbr bitrate={k} vbv-buffer-size={k} gop-size={gop} bframes=0 "
+                    f"preset=p4 tune=low-latency zerolatency=true repeat-sequence-header=true")
+        else:  # legacy GstNvBaseEnc nicks (no p1..p7, no tune); h264parse config-interval adds SPS/PPS
+            venc = (f"{encoder} name=venc rc-mode=cbr bitrate={k} vbv-buffer-size={k} gop-size={gop} bframes=0 "
+                    f"preset=low-latency-hq zerolatency=true")
         prof = "high"
     elif encoder == "x264enc":
         enc, conv = encoder, sw_scale
@@ -436,6 +603,16 @@ def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_de
     else:
         raise RuntimeError("No H.264 encoder found (tried vah264enc, vaapih264enc, nvh264enc, "
                            "nvautogpuh264enc, x264enc, openh264enc).")
+    return enc, conv, venc, prof
+
+
+def _build_pipeline(have, node, p, mic, sink_el, location, game_dev=None, mic_dev=None,
+                    game_vol=100, mic_gain=50, meter=False, av_offset_ms=0, shell=True, encoder=None):
+    """Return (pipeline string, encoder name) or raise RuntimeError.
+    shell=True -> quoted for /bin/sh + gst-launch; False -> for Gst.parse_launch (worker)."""
+    def qv(v):  # quote a property value
+        return shlex.quote(v) if shell else '"' + v.replace('"', '\\"') + '"'
+    enc, conv, venc, prof = _video_chain(have, p, encoder, shell)
     aenc = "avenc_aac" if have.get("avenc_aac") else ("fdkaacenc" if have.get("fdkaacenc") else None)
     if not aenc:
         raise RuntimeError("No AAC encoder found (avenc_aac / fdkaacenc)")
@@ -505,16 +682,20 @@ class Plugin:
     stop_ev = None
     reconnecting = 0
     stopping = False
+    starting = False
     health = {}
+    bad_encoders = frozenset()  # encoders that failed while live during this Go Live session
 
     # ---------- settings ----------
     async def get_state(self):
         s = _load()
+        vram = await _vram_total_mib()
         return {
             "platforms": [{"id": k, "label": v["label"], "needs_url": not v["url"]} for k, v in PLATFORMS.items() if k in ENABLED_PLATFORMS],
             "presets": list(PRESETS.keys()),
             "bitrates": {pl: {pr: _effective_kbps(pl, pr) for pr in PRESETS} for pl in ENABLED_PLATFORMS},
-            "platform": s["platform"], "preset": s["preset"], "mic": s["mic"], "mic_gain": s["mic_gain"], "game_vol": s["game_vol"], "av_offset": s["av_offset"], "encoder": s.get("encoder", "auto"), "encoder_prefs": ENCODER_PREFS,
+            "platform": s["platform"], "preset": effective_preset(s, vram), "mic": s["mic"], "mic_gain": s["mic_gain"], "game_vol": s["game_vol"], "av_offset": s["av_offset"], "encoder": s.get("encoder", "auto"), "encoder_prefs": ENCODER_PREFS,
+            "vram_total_mib": vram, "light_defaults": low_vram(vram) and not s.get("preset_set"),
             "has_key": {k: bool(v) for k, v in s["keys"].items()},
             "custom_urls": s["custom_urls"],
             "live": self._live(), "reconnecting": self.reconnecting,
@@ -525,8 +706,9 @@ class Plugin:
         s = _load()
         if platform in ENABLED_PLATFORMS:
             s["platform"] = platform
-        if preset in PRESETS:
+        if preset in PRESETS and preset != effective_preset(s, await _vram_total_mib()):
             s["preset"] = preset
+            s["preset_set"] = True  # an explicit choice overrides the low-VRAM light default
         s["mic"] = bool(mic)
         s["mic_gain"] = max(0, min(100, int(mic_gain)))
         s["game_vol"] = max(0, min(100, int(game_vol)))
@@ -551,9 +733,17 @@ class Plugin:
 
     # ---------- streaming ----------
     async def start_stream(self):
-        if self._live():
+        if self._live() or self.starting:
             return {"ok": False, "error": "Already live"}
+        self.starting = True  # a double tap must not start two pipelines (two NVENC sessions)
+        try:
+            return await self._start_stream()
+        finally:
+            self.starting = False
+
+    async def _start_stream(self):
         self.last_error = ""
+        self.bad_encoders = frozenset()
         self.stopping = False
         s = _load()
         plat = s["platform"] if s["platform"] in ENABLED_PLATFORMS else ENABLED_PLATFORMS[0]
@@ -566,6 +756,10 @@ class Plugin:
         env = _user_env()
         if not shutil.which("gst-launch-1.0"):
             return self._fail("gst-launch-1.0 not found on this system")
+        vram = await _vram_total_mib(env)
+        s["preset"] = effective_preset(s, vram)
+        if low_vram(vram) and not s.get("preset_set"):
+            decky.logger.info(f"{vram} MiB GPU: using light default preset {LIGHT_PRESET} (pick a preset to override)")
         p = dict(PRESETS[s["preset"]], kbps=_effective_kbps(plat, s["preset"]))
         decky.logger.info(f"Video bitrate {p['kbps']} kbps CBR ({plat}/{s['preset']})")
         have = await _available(env)
@@ -590,12 +784,15 @@ class Plugin:
     async def _launch(self, ctx):
         """(Re)resolve capture node + audio and spawn the pipeline. Raises RuntimeError."""
         env, s = ctx["env"], ctx["s"]
+        if not await _gi_available(env):  # fail closed before any encoder probe touches the GPU
+            raise RuntimeError(NO_GI_MSG)
         node = await _find_gamescope_node(env)
         if node is None:
             raise RuntimeError(NO_NODE_MSG)
         game_dev, mic_dev = await _resolve_audio(env)
         decky.logger.info(f"Audio: game={game_dev} mic={mic_dev if s['mic'] else 'off'}")
-        enc_name, ginfo = await self._choose_encoder(env, ctx["have"], s.get("encoder", "auto"))
+        enc_name, ginfo = await self._choose_encoder(env, ctx["have"], s.get("encoder", "auto"), ctx["p"],
+                                                     bad=self.bad_encoders)
         proc, mode, enc = await _spawn(env, dict(encoder=enc_name,
             have=ctx["have"], node=node, p=ctx["p"], mic=s["mic"], sink_el="rtmp2sink",
             location=ctx["location"], game_dev=game_dev, mic_dev=mic_dev, game_vol=s["game_vol"],
@@ -623,6 +820,27 @@ class Plugin:
                     if self.stopping:
                         break
                     self.last_error = msg or f"Pipeline exited ({rc})"
+                    if is_encoder_fault(self.encoder, msg, time.time() - t0, self.health):
+                        # Don't reconnect the same failing GPU encoder for 5 minutes: mark it bad
+                        # for this session and switch to the next one (VA-API / x264) right away.
+                        # The whole family: a second NVENC element on an out-of-memory GPU fails the same way.
+                        fam = ENC_FAMILY.get(self.encoder)
+                        self.bad_encoders = self.bad_encoders | {e for e, f in ENC_FAMILY.items() if f == fam}
+                        self.proc = None
+                        decky.logger.warning(f"Encoder {self.encoder} failed while live ({self.last_error}); "
+                                             f"skipping {fam} for this session")
+                        try:
+                            proc, mode = await self._launch(ctx)
+                            self.last_error = ""
+                            await self._emit_status()
+                            continue
+                        except NoEncoderError as e:
+                            self.last_error = _redact(str(e), ctx["key"])[:300]
+                            decky.logger.error(self.last_error)
+                            break
+                        except Exception as e:
+                            proc = None
+                            self.last_error = _redact(str(e), ctx["key"])[:300]
                 if time.time() - t0 > 60:  # it had been streaming fine: fresh backoff budget
                     attempts, outage_start = 0, None
                 outage_start = outage_start or time.time()
@@ -646,6 +864,10 @@ class Plugin:
                     self.reconnecting = 0
                     self.last_error = ""
                     await self._emit_status()
+                except NoEncoderError as e:
+                    self.last_error = _redact(str(e), ctx["key"])[:300]
+                    decky.logger.error(self.last_error)
+                    break
                 except Exception as e:
                     proc = None
                     self.last_error = _redact(str(e), ctx["key"])[:300]
@@ -725,15 +947,21 @@ class Plugin:
         if os.path.exists(path):
             os.remove(path)
         st = _load()
+        vram = await _vram_total_mib(env)
+        st["preset"] = effective_preset(st, vram)
         p = PRESETS[st["preset"]]
+        out["preset"] = st["preset"]
         game_dev, mic_dev = await _resolve_audio(env)
         out["game_source"] = game_dev or "@DEFAULT_MONITOR@ (unresolved)"
         out["mic_source"] = (mic_dev or "default (unresolved)") if st["mic"] else "off"
         out["av_offset"] = st["av_offset"]
         try:
-            enc_name, ginfo = await self._choose_encoder(env, have, st.get("encoder", "auto"), force_probe=True)
-            out["encoder_pref"], out["gpu"] = st.get("encoder", "auto"), ginfo
-            out["encoder_probe"] = {k: v["works"] for k, v in (await probe_encoders(env, have)).items()}
+            out["encoder_pref"] = st.get("encoder", "auto")
+            try:
+                enc_name, ginfo = await self._choose_encoder(env, have, out["encoder_pref"], p, force_probe=True)
+            finally:
+                out["gpu"] = dict(gpu_info(), vram_total_mib=vram)
+                out["encoder_probe"] = {k.split(" ")[0]: v["works"] for k, v in probe_snapshot(p).items()}
             proc, mode, enc = await _spawn(env, dict(encoder=enc_name,
                 have=have, node=pick["id"], p=p, mic=st["mic"], sink_el="filesink", location=path,
                 game_dev=game_dev, mic_dev=mic_dev, game_vol=st["game_vol"], mic_gain=st["mic_gain"],
@@ -844,18 +1072,26 @@ class Plugin:
 
     encoder = None
 
-    async def _choose_encoder(self, env, have, pref, force_probe=False):
-        works = {k: v["works"] for k, v in (await probe_encoders(env, have, force_probe)).items()}
+    async def _choose_encoder(self, env, have, pref, p, force_probe=False, bad=frozenset()):
+        """Lazy probe at Go Live: test only the encoders this setting allows, in order, at the real
+        resolution/fps, and stop at the first that works. Results are cached per encoder+size+fps."""
         ginfo = gpu_info()
-        enc = pick_encoder(pref, ginfo["display_gpu"], works)
-        decky.logger.info(f"Encoder: pref={pref} display_gpu={ginfo['display_gpu']} ({ginfo['source']}) -> {enc}")
-        return enc, ginfo
+        order = fallback_order(pref, ginfo["display_gpu"], bad) if bad else encoder_order(pref, ginfo["display_gpu"])
+        tried = []
+        for e in order:
+            r = await _probe_one(env, have, e, p, force_probe)
+            if r["works"]:
+                decky.logger.info(f"Encoder: pref={pref} display_gpu={ginfo['display_gpu']} ({ginfo['source']}) "
+                                  f"{p['w']}x{p['h']}@{p['fps']} -> {e}")
+                return e, ginfo
+            tried.append(f"{e}: {r['error']}" if r["present"] else f"{e}: not installed")
+        tried += [f"{e}: failed while live" for e in bad]
+        raise NoEncoderError(_no_encoder_msg(pref, "; ".join(tried)))
 
     async def get_encoders(self):
-        env = _user_env()
-        have = await _available(env)
-        probe = await probe_encoders(env, have, force=True)
-        return {"probe": probe, "gpu": gpu_info(), "families": ENC_FAMILY}
+        """Cached probe results only; never opens an encoder (no VRAM use while a game runs)."""
+        return {"probe": probe_snapshot(), "gpu": dict(gpu_info(), vram_total_mib=await _vram_total_mib()),
+                "families": ENC_FAMILY, "bad": sorted(self.bad_encoders)}
 
     async def _main(self):
         decky.logger.info("Deck Live loaded")

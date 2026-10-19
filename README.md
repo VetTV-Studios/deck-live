@@ -14,12 +14,15 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 
 ## Encoder selection (branch `feature/encoder-fallback`)
 **Encoder** setting: *Auto* / *VA-API* / *NVENC* / *Software*.
-- **Startup probe:** at the first stream (and on every Diagnostics run) each encoder gets a 15-frame test encode, since VA and NVENC can be installed but still fail to open the GPU.
+- **Probe at Go Live, lazily:** nothing is opened when the plugin loads or the panel opens. At Go Live, only the encoders the setting allows are test-encoded, in order, and probing stops at the first that works. The 10-frame test uses the real stream resolution, fps, upload/scale chain and encoder properties, runs in its own short-lived process (pipeline set to NULL and released, process exits) and times out after 8 s. Results are cached per encoder, resolution and fps; Diagnostics re-tests only the encoder it needs.
+- **Element checks** use `gst-inspect-1.0 --exists` (registry lookup), so checking for nvcodec/VA elements does not load those plugins or open the GPU.
 - **Order:** `vah264enc` → `vaapih264enc` → `nvh264enc` / `nvautogpuh264enc` → `x264enc` → `openh264enc` (last resort).
 - **Auto:** puts NVENC first when the display (gamescope) runs on an NVIDIA GPU, detected from `gamescope --prefer-vk-device 10de:…` or from the DRM card driving the connected display, internal panel first. Otherwise VA-API comes first.
-- **Forcing a family:** forcing VA-API or NVENC still falls back along the chain if it doesn't work. *Software* never switches to hardware.
+- **Forcing a family:** *VA-API*, *NVENC* and *Software* probe only that family. If it doesn't work, Go Live stops with a message suggesting Auto or Software. *Software* never switches to hardware.
+- **Failure while live:** if a VA-API or NVENC pipeline dies because of the encoder or GPU (for example CUDA out of memory), that family is skipped for the rest of the session and the stream restarts right away on the next encoder (VA-API, then x264) instead of retrying the same one for 5 minutes. Network errors still use the normal reconnect backoff.
+- **4 GB GPUs:** when `nvidia-smi` reports 4096 MiB or less (for example an RTX 3050 4GB), the default preset is 720p30 at 4500 kbps. Picking a preset overrides it. NVENC is not opened when less than 512 MiB of VRAM is free.
 - **NVENC path:**
-  - Encoder settings: `cudaupload ! cudaconvertscale add-borders=true` (GPU scale, kept in CUDA memory) → `nvh264enc rc-mode=cbr bitrate=N vbv-buffer-size=N gop-size=fps*2 bframes=0 preset=p4 tune=low-latency zerolatency=true repeat-sequence-header=true`.
+  - Encoder settings: `cudaupload ! cudaconvertscale add-borders=true` (GPU scale, kept in CUDA memory) → `nvh264enc rc-mode=cbr bitrate=N vbv-buffer-size=N gop-size=fps*2 bframes=0 preset=p4 tune=low-latency zerolatency=true repeat-sequence-header=true` on GStreamer 1.22+. Older `nvh264enc` (GstNvBaseEnc) gets `preset=low-latency-hq zerolatency=true` instead, and the probe uses the same string.
   - Without the CUDA elements, frames are converted and scaled on the CPU (`videoconvert ! videoscale`) and passed to nvh264enc in system memory.
 - **Health line:** shows the encoder in use.
 

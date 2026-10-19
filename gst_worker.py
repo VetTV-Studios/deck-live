@@ -10,36 +10,42 @@ from gi.repository import Gst, GLib
 
 Gst.init(None)
 
-PROBE_PIPE = ("videotestsrc num-buffers=15 ! video/x-raw,width=640,height=360,framerate=30/1 ! "
-              "videoconvert ! {enc} ! fakesink")
 
 
-def probe(names):
-    """Gst.ElementFactory.find + a 15-frame test encode per encoder (nvcodec/VA may register
-    but fail to open the device). Prints one JSON line."""
-    res = {}
-    for n in names:
-        if Gst.ElementFactory.find(n) is None:
-            res[n] = {"present": False, "works": False, "error": "not installed"}
-            continue
-        err = ""
-        try:
-            p = Gst.parse_launch(PROBE_PIPE.format(enc=n))
-            p.set_state(Gst.State.PLAYING)
-            msg = p.get_bus().timed_pop_filtered(8 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
-            if msg is None:
-                err = "timeout"
-            elif msg.type == Gst.MessageType.ERROR:
-                err = msg.parse_error()[0].message
+def probe_encoder(pipeline, timeout_s=8):
+    """--probe mode: run one short test-encode pipeline (read from stdin) to EOS and print
+    {"works": bool, "error": str}. The pipeline is always set to NULL and released before exit, and
+    the caller runs one process per probe, so any CUDA/VA context is gone when this returns."""
+    err, p = "", None
+    try:
+        p = Gst.parse_launch(pipeline)
+        if p.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            err = "failed to start"
+        bus = p.get_bus()
+        msg = None if err else bus.timed_pop_filtered(int(timeout_s * Gst.SECOND),
+                                                      Gst.MessageType.EOS | Gst.MessageType.ERROR)
+        if err:
+            pass
+        elif msg is None:
+            err = "timeout"
+        elif msg.type == Gst.MessageType.ERROR:
+            e, _dbg = msg.parse_error()
+            err = f"{msg.src.get_name() if msg.src else '?'}: {e.message}"
+    except Exception as e:  # parse failure (e.g. unknown property nick on an older element)
+        err = str(e) or type(e).__name__
+    finally:
+        if p is not None:
             p.set_state(Gst.State.NULL)
-        except Exception as e:  # parse/instantiate failure
-            err = str(e)
-        res[n] = {"present": True, "works": not err, "error": err[:200]}
-    print(json.dumps(res), flush=True)
+            p.get_state(2 * Gst.SECOND)
+            del p
+            import gc
+            gc.collect()
+    print(json.dumps({"works": not err, "error": err[:300]}), flush=True)
 
 
-if len(sys.argv) > 2 and sys.argv[1] == "--probe":
-    probe(sys.argv[2:])
+if len(sys.argv) > 1 and sys.argv[1] == "--probe":
+    req = json.loads(sys.stdin.read())
+    probe_encoder(req["pipeline"], float(req.get("timeout") or 8))
     sys.exit(0)
 
 cfg = json.loads(sys.stdin.read())

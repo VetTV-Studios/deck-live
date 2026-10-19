@@ -22,14 +22,15 @@ class Order(unittest.TestCase):
         self.assertEqual(m.encoder_order("auto", "intel")[:2], ["vah264enc", "vaapih264enc"])
         self.assertEqual(m.encoder_order("auto", None)[0], "vah264enc")
         self.assertEqual(m.encoder_order("auto", "nvidia")[:2], ["nvh264enc", "nvautogpuh264enc"])
-        self.assertEqual(m.encoder_order("nvenc", "intel")[0], "nvh264enc")
-        self.assertEqual(m.encoder_order("vaapi", "nvidia")[0], "vah264enc")
+        self.assertEqual(m.encoder_order("nvenc", "intel"), ["nvh264enc", "nvautogpuh264enc"])
+        self.assertEqual(m.encoder_order("vaapi", "nvidia"), ["vah264enc", "vaapih264enc"])
         self.assertEqual(m.encoder_order("software", "nvidia"), ["x264enc", "openh264enc"])
 
     def test_pick_fallbacks(self):
         w = {"vah264enc": False, "nvh264enc": True, "x264enc": True}
         self.assertEqual(m.pick_encoder("auto", "intel", w), "nvh264enc")      # VA broken -> NVENC
-        self.assertEqual(m.pick_encoder("vaapi", "intel", w), "nvh264enc")     # forced VA missing -> chain
+        with self.assertRaises(m.NoEncoderError):                              # forced VA: only VA is tried
+            m.pick_encoder("vaapi", "intel", w)
         self.assertEqual(m.pick_encoder("software", "nvidia", w), "x264enc")
         self.assertEqual(m.pick_encoder("auto", "nvidia", {"nvautogpuh264enc": True, "vah264enc": True}),
                          "nvautogpuh264enc")
@@ -71,14 +72,14 @@ class Gpu(unittest.TestCase):
                       ["/usr/bin/gamescope", "-e", "--prefer-vk-device", "10de:25a2", "--", "steam"])
         self.assertEqual(g["display_gpu"], "nvidia"); self.assertIn("prefer-vk-device", g["source"])
 
+    @unittest.skipUnless(os.environ.get("DECK_LIVE_DEVICE_TESTS"), "opens real encoders; set DECK_LIVE_DEVICE_TESTS=1")
     def test_probe_and_choose_on_box(self):
         import asyncio
         env = m._user_env()
         have = asyncio.run(m._available(env))
-        probe = asyncio.run(m.probe_encoders(env, have, force=True))
-        enc, g = asyncio.run(m.Plugin()._choose_encoder(env, have, "auto"))
-        print("\nbox probe:", {k: v["works"] for k, v in probe.items()}, "->", enc, g["display_gpu"])
-        self.assertTrue(probe[enc]["works"])
+        enc, g = asyncio.run(m.Plugin()._choose_encoder(env, have, "auto", m.PRESETS["720p30"]))
+        print("\nbox probe:", m.probe_snapshot(), "->", enc, g["display_gpu"])
+        self.assertTrue(m.probe_snapshot(m.PRESETS["720p30"])[f"{enc} 1280x720@30"]["works"])
 
     def test_real_box_does_not_crash(self):
         self.assertIn("display_gpu", m.gpu_info())
@@ -136,13 +137,15 @@ class Pipelines(unittest.TestCase):
 
     @unittest.skipUnless(os.path.exists("/usr/bin/python3"), "needs system python + gi")
     def test_worker_probe(self):
-        out = subprocess.run(["/usr/bin/python3", WORKER, "--probe", "x264enc", "nvh264enc", "bogusenc"],
-                             capture_output=True, text=True, timeout=60).stdout.strip().splitlines()[-1]
-        r = json.loads(out)
-        self.assertFalse(r["bogusenc"]["present"]); self.assertFalse(r["nvh264enc"]["works"])
-        if r["x264enc"]["present"]:
-            self.assertTrue(r["x264enc"]["works"])
-
+        def probe(pipe):
+            out = subprocess.run(["/usr/bin/python3", WORKER, "--probe"], input=json.dumps({"pipeline": pipe, "timeout": 8}),
+                                 capture_output=True, text=True, timeout=60).stdout.strip().splitlines()[-1]
+            return json.loads(out)
+        p = m.PRESETS["1080p60"]
+        r = probe(m._probe_pipeline({"x264enc": True}, "x264enc", p))
+        self.assertTrue(r["works"], r)
+        self.assertFalse(probe("videotestsrc num-buffers=5 ! bogusenc ! fakesink")["works"])
+        self.assertFalse(probe(m._probe_pipeline(ALL, "nvh264enc", p))["works"])  # no NVIDIA here
 
 if __name__ == "__main__":
     unittest.main()

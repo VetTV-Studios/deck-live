@@ -102,7 +102,7 @@ class FailClosed(unittest.TestCase):
         m._save({**m.DEFAULTS, "keys": {"youtube": KEY}, "preset": "720p30"})
         with mock.patch.object(m, "_gi_available", no_gi), mock.patch.object(m, "_available", have), \
                 mock.patch.object(m, "_find_gamescope_node", node), mock.patch.object(m, "_resolve_audio", audio), \
-                mock.patch("shutil.which", return_value="/usr/bin/gst-launch-1.0"), \
+                mock.patch("shutil.which", lambda n: "/usr/bin/" + n if n.startswith("gst") else None), \
                 mock.patch("asyncio.create_subprocess_shell") as sh, \
                 self.assertLogs("t", "INFO") as logs:
             r = run(m.Plugin().start_stream())
