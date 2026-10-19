@@ -1,5 +1,5 @@
 """Session, Go Live, and diagnostics file tests. No GPU. Run: python3 -m unittest discover -s tests"""
-import asyncio, os, stat, sys, tempfile, types, unittest
+import asyncio, json, logging, os, stat, sys, tempfile, types, unittest
 from unittest import mock
 
 sys.modules.setdefault("decky", types.SimpleNamespace(
@@ -116,6 +116,38 @@ class Session(unittest.TestCase):
         self.assertTrue(result.get("ok"), result)
         self.assertEqual(second.get("error"), "Already live")
         self.assertFalse(plugin.starting)
+
+    def test_chat_state_does_not_include_tokens(self):
+        plugin = m.Plugin()
+        logs = []
+
+        class H(logging.Handler):
+            def emit(self, record):
+                logs.append(record.getMessage())
+
+        handler = H()
+        m.decky.logger.addHandler(handler)
+        token = "oauth:super-secret-token"
+        key = "AIzaSySUPERSECRETKEY12"
+        try:
+            self.assertTrue(run(plugin.chat_set_oauth(token, "vet")))
+            self.assertTrue(run(plugin.chat_set_yt_key(key)))
+            st = run(plugin.chat_get_state())
+        finally:
+            m.decky.logger.removeHandler(handler)
+            if plugin._chat is not None:
+                run(plugin._chat.close())
+        blob = json.dumps(st) + "\n" + "\n".join(logs)
+        self.assertNotIn("super-secret-token", blob)
+        self.assertNotIn(key, blob)
+        self.assertTrue(st["has_oauth"])
+        self.assertTrue(st["has_yt_key"])
+        self.assertTrue(st["has_login"])
+        self.assertTrue(st["overlay_url"].startswith("http://127.0.0.1:"))
+        with open(m.SETTINGS_PATH) as f:
+            saved = f.read()
+        self.assertIn(token, saved)
+        self.assertEqual(stat.S_IMODE(os.stat(m.SETTINGS_PATH).st_mode), 0o600)
 
 
 class DiagFile(unittest.TestCase):

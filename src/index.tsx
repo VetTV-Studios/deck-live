@@ -6,6 +6,7 @@ import { addEventListener, removeEventListener, callable, definePlugin, toaster 
 import { useEffect, useState } from "react";
 import { FaBroadcastTower } from "react-icons/fa";
 import { GameHelpSection, registerGameHelpPrefetch } from "./gamehelp";
+import { ChatSection } from "./chat";
 
 type Platform = { id: string; label: string; needs_url: boolean };
 type State = {
@@ -107,6 +108,7 @@ function Content() {
         </PanelSectionRow>
       </PanelSection>
       <GameHelpSection />
+      <ChatSection />
       <PanelSection title="Destination">
         <PanelSectionRow>
           <DropdownItem label="Platform" disabled={st.live}

@@ -1,0 +1,43 @@
+{
+  "kind": "youtube#liveChatMessageListResponse",
+  "pollingIntervalMillis": 7500,
+  "nextPageToken": "page-2",
+  "items": [
+    {
+      "id": "LCC.msg1",
+      "snippet": {
+        "type": "textMessageEvent",
+        "liveChatId": "CHATID",
+        "publishedAt": "2026-10-18T20:00:00.000Z",
+        "displayMessage": "hello !1",
+        "textMessageDetails": {"messageText": "hello !1"}
+      },
+      "authorDetails": {
+        "channelId": "UCvet",
+        "displayName": "Vet",
+        "isChatOwner": false,
+        "isChatModerator": true,
+        "isChatSponsor": false
+      }
+    },
+    {
+      "id": "LCC.msg2",
+      "snippet": {
+        "type": "superChatEvent",
+        "liveChatId": "CHATID",
+        "publishedAt": "2026-10-18T20:00:01.000Z",
+        "displayMessage": "lets go !2"
+      },
+      "authorDetails": {
+        "channelId": "UCace",
+        "displayName": "Ace",
+        "isChatSponsor": true
+      }
+    },
+    {
+      "id": "LCC.deleted",
+      "snippet": {"type": "messageDeletedEvent", "liveChatId": "CHATID", "displayMessage": "secret"},
+      "authorDetails": {"channelId": "UCgone", "displayName": "Gone"}
+    }
+  ]
+}

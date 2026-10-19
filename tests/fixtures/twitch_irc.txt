@@ -1,0 +1,7 @@
+PING :tmi.twitch.tv
+:justinfan12345!justinfan12345@justinfan12345.tmi.twitch.tv JOIN #vettv
+:tmi.twitch.tv NOTICE * :Login authentication failed
+@badge-info=;badges=moderator/1,subscriber/6;display-name=Vet\sTV;id=msg-1;mod=1;user-id=111;tmi-sent-ts=1710000000000 :vet!vet@vet.tmi.twitch.tv PRIVMSG #vettv :hello !1
+@badge-info=;badges=;display-name=Ace;id=msg-2;user-id=222 :ace!ace@ace.tmi.twitch.tv PRIVMSG #vettv :going !2 now
+:bob!bob@bob.tmi.twitch.tv PRIVMSG #vettv :plain hi
+@badge-info=;badges=;display-name=Vet\sTV;id=msg-3;user-id=111 :vet!vet@vet.tmi.twitch.tv PRIVMSG #vettv :!2
