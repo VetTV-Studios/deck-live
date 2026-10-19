@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased (fix/stream-key-leak)
+- Security: Go Live no longer falls back to `gst-launch-1.0` when PyGObject is missing. That fallback put the RTMP URL with the stream key on the command line, readable by any local process through `/proc/<pid>/cmdline`. Streaming now refuses to start with a clear message (install `python3-gobject` or update Bazzite/SteamOS). Diagnostics, which only writes a local file, can still use gst-launch.
+- A failed PyGObject check is no longer cached, so installing `python3-gobject` works after a reload instead of a Decky restart.
+- Logs and error messages redact the stream key (raw and percent-encoded) and any `rtmp://` / `rtmps://` URL.
+- `settings.json` (stream keys) is now created with mode 0600 from the start, fsync'd, and its folder is 0700. A file left 0644 by an older build is tightened on load.
+
 ## Unreleased (feature/game-help)
 - Game Help add-on (Stadia Lab spec 04): YouTube help videos for the running game. Topics, custom search, locked-achievement guides, pinned channel, 7-day cache, API quota guard, yt-dlp no-key fallback, offline cache, and pre-fetch on game launch.
 

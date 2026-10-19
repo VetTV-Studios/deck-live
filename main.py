@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import time
+import urllib.parse
 
 import decky
 
@@ -52,6 +53,10 @@ DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain"
 
 def _load():
     try:
+        os.chmod(SETTINGS_PATH, 0o600)  # tighten files left 0644 by older builds
+    except OSError:
+        pass
+    try:
         with open(SETTINGS_PATH) as f:
             return {**DEFAULTS, **json.load(f)}
     except Exception:
@@ -59,12 +64,49 @@ def _load():
 
 
 def _save(s):
-    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+    """Atomic, durable write. The file holds stream keys: it is created 0600 (never briefly
+    world-readable) and fsync'd before and after the rename."""
+    d = os.path.dirname(SETTINGS_PATH)
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)  # only this plugin reads its settings dir
+    except OSError:
+        pass
     tmp = SETTINGS_PATH + ".tmp"
-    with open(tmp, "w") as f:
+    try:
+        os.unlink(tmp)  # a stale tmp could have looser permissions; O_CREAT keeps existing modes
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)  # in case the umask was odd
         json.dump(s, f)
-    os.chmod(tmp, 0o600)  # stream keys live here
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, SETTINGS_PATH)
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+_URL_RE = re.compile(r"\brtmps?://[^\s'\"<>]+", re.I)
+
+
+def _redact(text, key=None):
+    """Remove the stream key (raw and percent-encoded) and any RTMP(S) URL from log/error text."""
+    if not text:
+        return text
+    if key:
+        text = text.replace(key, "<redacted>")
+        for enc in {urllib.parse.quote(key, safe=""), urllib.parse.quote(key)}:
+            if enc and enc != key:
+                text = text.replace(enc, "<redacted>")
+    return _URL_RE.sub("<redacted-url>", text)
 
 
 def _user_env():
@@ -165,19 +207,27 @@ RECONNECT_GIVE_UP_S = 300
 
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gst_worker.py")
 SYS_PY = "/usr/bin/python3"
-_gi_ok = None
+_gi_ok = False
+
+NO_GI_MSG = ("Streaming needs PyGObject (python3-gobject) and the GStreamer typelibs so your stream key "
+             "stays private. Install python3-gobject, or update Bazzite/SteamOS, then reload Decky.")
 
 
 async def _gi_available(env):
+    """True when system python3 + PyGObject + gst_worker.py can run. Only success is cached,
+    so installing python3-gobject works without restarting Decky."""
     global _gi_ok
-    if _gi_ok is None:
+    if not _gi_ok:
         _gi_ok = bool(os.path.exists(SYS_PY) and os.path.exists(WORKER) and "ok" in await _run(
             f"{SYS_PY} -c \"import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst; print('ok')\"", env))
     return _gi_ok
 
 
 async def _spawn(env, args):
-    """args: kwargs for _build_pipeline minus shell. Returns (proc, mode, enc)."""
+    """args: kwargs for _build_pipeline minus shell. Returns (proc, mode, enc).
+    Network output only ever runs through the worker, which reads the pipeline (and so the
+    stream key) from stdin. gst-launch would put the key in argv, readable by any local process
+    via /proc/<pid>/cmdline, so it is refused (fail closed) and kept for local Diagnostics only."""
     if await _gi_available(env):
         pipe, enc = _build_pipeline(**{k: v for k, v in args.items() if k != "_duration"}, shell=False)
         proc = await asyncio.create_subprocess_exec(
@@ -187,6 +237,8 @@ async def _spawn(env, args):
         await proc.stdin.drain()
         proc.stdin.close()
         return proc, "worker", enc
+    if args.get("sink_el") != "filesink":
+        raise RuntimeError(NO_GI_MSG)
     pipe, enc = _build_pipeline(**{k: v for k, v in args.items() if k != "_duration"}, shell=True)
     proc = await asyncio.create_subprocess_shell(
         f"exec gst-launch-1.0 -e -m {pipe}", env=env, stdout=asyncio.subprocess.PIPE,
@@ -471,7 +523,7 @@ class Plugin:
                     await self._emit_status()
                 except Exception as e:
                     proc = None
-                    self.last_error = str(e)[:300]
+                    self.last_error = _redact(str(e), ctx["key"])[:300]
         finally:
             self.proc = None
             self.reconnecting = 0
@@ -511,9 +563,7 @@ class Plugin:
         err = (await errtask).decode(errors="replace").strip()
         rc = await proc.wait()
         msg = worker_err or (err.splitlines()[-1] if err else "")
-        if key:
-            msg = msg.replace(key, "<redacted>")
-            err = err.replace(key, "<redacted>")
+        msg, err = _redact(msg, key), _redact(err, key)
         if self.stopping:
             decky.logger.info(f"Stream stopped by user (rc={rc})")
         else:
@@ -646,6 +696,7 @@ class Plugin:
         return out
 
     def _fail(self, msg):
+        msg = _redact(msg)
         self.last_error = msg
         decky.logger.error(msg)
         return {"ok": False, "error": msg}
