@@ -1,6 +1,6 @@
 {
   "name": "decky-livestream",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Live stream Game Mode via RTMP",
   "type": "module",
   "scripts": {

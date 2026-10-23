@@ -16,13 +16,13 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 - Decky Loader (API v1) in Game Mode (gamescope exposes the PipeWire video node `gamescope`).
 - PipeWire with pipewire-pulse (`pactl`, `pw-dump`).
 - GStreamer (tested with 1.28; 1.20+ likely needed for the `va` plugin) with `gst-launch-1.0`, `gst-inspect-1.0` and these elements: `pipewiresrc`, `pulsesrc`, `vapostproc`, `vah264enc` (or one of the fallback encoders), `h264parse`, `videorate`, `avenc_aac` (or `fdkaacenc`), `flvmux`, `rtmp2sink`. `level` and `webrtcdsp` are optional.
-- Required for streaming: system `python3` with PyGObject (`gi`, package `python3-gobject`) and the GStreamer typelibs. The worker reads the pipeline, including the stream key, from stdin, so the key never appears on a command line. Without PyGObject, Go Live refuses to start and says so; only local Diagnostics may fall back to `gst-launch-1.0` (no health stats).
+- Required for streaming: system `python3` and GStreamer with the elements above. When PyGObject (`gi`, package `python3-gobject`) and the GStreamer typelibs are available, the worker reads the pipeline, including the stream key, from stdin. Otherwise, a protected `gst-launch-1.0` runner reads the pipeline over stdin and disables ptrace access before exec, preventing other local users from reading the key from `/proc/<pid>/cmdline`; health stats are unavailable in this mode. Go Live is refused if the system cannot protect the process arguments.
 
 ## Tested devices
 | Device | OS | Result |
 |---|---|---|
 | Lenovo Legion Go | Bazzite (GStreamer 1.28.8) | ✅ 1080p60 to YouTube, smooth, in sync at −160 ms |
-| Steam Deck LCD/OLED | SteamOS Stable/Beta/Preview | ❓ untested (SteamOS may lack some GStreamer elements or PyGObject) |
+| Steam Deck LCD/OLED | SteamOS Stable/Beta/Preview | ❓ untested (requires the listed GStreamer elements; private gst-launch mode supports systems without PyGObject) |
 
 ## Install
 
@@ -56,10 +56,10 @@ Not listed in the Decky Plugin Store.
 
 ## Build
     pnpm install && pnpm build
-    ./package.sh        # -> ../deck-live.zip (zip of dist/, main.py, gst_worker.py, plugin.json, package.json, LICENSE, README)
+    ./package.sh        # -> ../deck-live.zip (includes both streaming runners)
 
 ## How it works
-`main.py` (the Decky backend) builds a GStreamer pipeline and runs it in `gst_worker.py` (system python3 + PyGObject). Streaming never falls back to `gst-launch-1.0`, because that would expose the stream key in the process list:
+`main.py` (the Decky backend) builds a GStreamer pipeline and runs it in `gst_worker.py` (system python3 + PyGObject) when available. Otherwise, it starts `gst-launch-1.0` through `gst_launch_worker.py`; that runner reads the pipeline from stdin and disables ptrace access before exec, preventing other local users from reading the key from `/proc/<pid>/cmdline`:
 
     pipewiresrc(gamescope, always-copy) → leaky queue → vapostproc (GPU scale, add-borders)
       → videorate (CFR) → vah264enc (CBR, 2 s GOP, no B-frames) → h264parse → [video delay = −A/V offset]

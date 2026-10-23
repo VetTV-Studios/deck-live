@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.3 — 2026-10-23
+- SteamOS compatibility: Go Live can now use systems that have GStreamer but not PyGObject, using a protected gst-launch runner that receives the pipeline over stdin and disables ptrace access before exec to keep the stream key out of readable process arguments.
+- Streaming still fails closed if the operating system cannot protect the process arguments. Health statistics remain available with PyGObject; the gst-launch runner reports live/offline status without detailed health.
+
 ## 1.0.2 — 2026-10-18
 - Security: Go Live no longer falls back to `gst-launch-1.0` when PyGObject is missing. That fallback put the RTMP URL with the stream key on the command line, readable by any local process through `/proc/<pid>/cmdline`. Streaming now refuses to start with a clear message (install `python3-gobject` or update Bazzite/SteamOS). Diagnostics, which only writes a local file, can still use gst-launch.
 - A failed PyGObject check is no longer cached, so installing `python3-gobject` works after a reload instead of a Decky restart.

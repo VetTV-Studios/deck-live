@@ -1,5 +1,5 @@
 """Stream-key safety tests (no GPU or GStreamer needed). Run: python3 -m unittest discover -s tests"""
-import asyncio, json, os, stat, sys, tempfile, types, unittest
+import asyncio, io, json, os, stat, sys, tempfile, types, unittest
 from unittest import mock
 
 sys.modules.setdefault("decky", types.SimpleNamespace(
@@ -8,6 +8,7 @@ sys.modules.setdefault("decky", types.SimpleNamespace(
     emit=None))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import main as m  # noqa: E402
+import gst_launch_worker as glw  # noqa: E402
 
 KEY = "abcd-efgh/ijkl+mnop"
 URL = "rtmps://a.rtmps.youtube.com:443/live2/" + KEY
@@ -22,29 +23,50 @@ def run(coro):
 class FailClosed(unittest.TestCase):
     def setUp(self):
         m._gi_ok = False
+        m._secure_gst_ok = False
 
-    def test_no_pygobject_refuses_to_stream_and_never_shells_out(self):
+    def test_no_pygobject_uses_private_gst_launch_runner(self):
         async def no_gi(env):
             return False
+        async def secure_runner(env):
+            return True
+        class P:
+            class stdin:
+                buf = b""
+                @classmethod
+                def write(cls, b): cls.buf += b
+                @staticmethod
+                async def drain(): pass
+                @staticmethod
+                def close(): pass
+        async def fake_exec(*argv, **kw):
+            fake_exec.argv = argv
+            return P
         with mock.patch.object(m, "_gi_available", no_gi), \
-                mock.patch("asyncio.create_subprocess_shell") as sh, \
-                mock.patch("asyncio.create_subprocess_exec") as ex:
-            with self.assertRaises(RuntimeError) as cm:
-                run(m._spawn({}, dict(ARGS)))
+                mock.patch.object(m, "_secure_gst_available", secure_runner), \
+                mock.patch("asyncio.create_subprocess_exec", fake_exec), \
+                mock.patch("asyncio.create_subprocess_shell") as sh:
+            proc, mode, enc = run(m._spawn({}, dict(ARGS)))
             sh.assert_not_called()
-            ex.assert_not_called()
-        self.assertIn("PyGObject", str(cm.exception))
-        self.assertIn("python3-gobject", str(cm.exception))
-        self.assertNotIn(KEY, str(cm.exception))
+        self.assertIs(proc, P)
+        self.assertEqual(mode, "gst-launch")
+        self.assertFalse(any(KEY in str(a) for a in fake_exec.argv))
+        self.assertIn(KEY, json.loads(P.stdin.buf)["pipeline"])
 
-    def test_refuses_any_network_sink_even_without_key(self):
+    def test_network_output_refuses_if_process_privacy_is_unavailable(self):
         async def no_gi(env):
+            return False
+        async def no_secure_runner(env):
             return False
         args = dict(ARGS, location="rtmp://example.invalid/app")
-        with mock.patch.object(m, "_gi_available", no_gi), mock.patch("asyncio.create_subprocess_shell") as sh:
+        with mock.patch.object(m, "_gi_available", no_gi), \
+                mock.patch.object(m, "_secure_gst_available", no_secure_runner), \
+                mock.patch("asyncio.create_subprocess_shell") as sh, \
+                mock.patch("asyncio.create_subprocess_exec") as ex:
             with self.assertRaises(RuntimeError):
                 run(m._spawn({}, args))
             sh.assert_not_called()
+            ex.assert_not_called()
 
     def test_diagnostics_filesink_may_still_use_gst_launch(self):
         async def no_gi(env):
@@ -79,6 +101,32 @@ class FailClosed(unittest.TestCase):
         self.assertFalse(any(KEY in str(a) for a in fake_exec.argv))
         self.assertIn(KEY, json.loads(P.stdin.buf)["pipeline"])  # delivered over stdin instead
 
+    def test_gst_launch_runner_locks_process_access_before_exec(self):
+        events = []
+        cfg = {"pipeline": 'rtmp2sink location="' + URL + '"'}
+        with mock.patch.object(glw, "_disable_proc_access", lambda: events.append("locked")), \
+                mock.patch.object(glw, "sys") as worker_sys, \
+                mock.patch.object(glw.shutil, "which", return_value="/usr/bin/gst-launch-1.0"), \
+                mock.patch.object(glw.os, "execvpe", side_effect=lambda *args: events.append(("exec", args))):
+            worker_sys.argv = ["gst_launch_worker.py"]
+            worker_sys.stdin = io.StringIO(json.dumps(cfg))
+            glw.main()
+        self.assertEqual(events[0], "locked")
+        self.assertEqual(events[1][0], "exec")
+        self.assertIn(KEY, events[1][1][1][-1])
+
+    def test_gst_launch_runner_refuses_exec_if_lock_fails(self):
+        cfg = {"pipeline": 'rtmp2sink location="' + URL + '"'}
+        with mock.patch.object(glw, "_disable_proc_access", side_effect=OSError("prctl failed")), \
+                mock.patch.object(glw, "sys") as worker_sys, \
+                mock.patch.object(glw.shutil, "which", return_value="/usr/bin/gst-launch-1.0"), \
+                mock.patch.object(glw.os, "execvpe") as execvpe:
+            worker_sys.argv = ["gst_launch_worker.py"]
+            worker_sys.stdin = io.StringIO(json.dumps(cfg))
+            with self.assertRaises(OSError):
+                glw.main()
+            execvpe.assert_not_called()
+
     def test_failed_gi_check_is_not_cached(self):
         calls = []
         async def fake_run(cmd, env):
@@ -95,20 +143,27 @@ class FailClosed(unittest.TestCase):
             return False
         async def have(env):
             return dict(HAVE)
+        async def no_secure_runner(env):
+            return False
         async def node(env):
             return 7
         async def audio(env):
             return "mon", None
-        m._save({**m.DEFAULTS, "keys": {"youtube": KEY}, "preset": "720p30"})
-        with mock.patch.object(m, "_gi_available", no_gi), mock.patch.object(m, "_available", have), \
+        settings = {**m.DEFAULTS, "keys": {"youtube": KEY}, "preset": "720p30"}
+        with mock.patch.object(m, "_gi_available", no_gi), \
+                mock.patch.object(m, "_secure_gst_available", no_secure_runner), \
+                mock.patch.object(m, "_available", have), \
+                mock.patch.object(m, "_load", return_value=settings), \
                 mock.patch.object(m, "_find_gamescope_node", node), mock.patch.object(m, "_resolve_audio", audio), \
                 mock.patch("shutil.which", return_value="/usr/bin/gst-launch-1.0"), \
                 mock.patch("asyncio.create_subprocess_shell") as sh, \
+                mock.patch("asyncio.create_subprocess_exec") as ex, \
                 self.assertLogs("t", "INFO") as logs:
             r = run(m.Plugin().start_stream())
             sh.assert_not_called()
+            ex.assert_not_called()
         self.assertFalse(r["ok"])
-        self.assertIn("PyGObject", r["error"])
+        self.assertIn("Secure GStreamer runner", r["error"])
         self.assertFalse(any(KEY in line for line in logs.output))
 
 
@@ -133,6 +188,8 @@ class Redact(unittest.TestCase):
         self.assertNotIn("secret", r["error"]); self.assertNotIn("secret", "".join(logs.output))
 
 
+@unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+                     "settings permission checks require POSIX")
 class SettingsFile(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()

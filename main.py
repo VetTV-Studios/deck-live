@@ -197,11 +197,13 @@ RECONNECT_DELAYS = [2, 5, 10, 20, 30]  # then 30 s repeatedly
 RECONNECT_GIVE_UP_S = 300
 
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gst_worker.py")
+GST_LAUNCH_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gst_launch_worker.py")
 SYS_PY = "/usr/bin/python3"
 _gi_ok = False
+_secure_gst_ok = False
 
-NO_GI_MSG = ("Streaming needs PyGObject (python3-gobject) and the GStreamer typelibs so your stream key "
-             "stays private. Install python3-gobject, or update Bazzite/SteamOS, then reload Decky.")
+NO_SECURE_GST_MSG = ("Secure GStreamer runner unavailable. Update Deck Live and verify this system supports "
+                     "Linux process privacy controls.")
 
 
 async def _gi_available(env):
@@ -214,11 +216,23 @@ async def _gi_available(env):
     return _gi_ok
 
 
+async def _secure_gst_available(env):
+    """Check that the stdin-based gst-launch runner can hide argv from other local users."""
+    global _secure_gst_ok
+    if (not _secure_gst_ok and os.path.exists(SYS_PY)
+            and os.path.exists(GST_LAUNCH_WORKER)):
+        p = await asyncio.create_subprocess_exec(
+            SYS_PY, GST_LAUNCH_WORKER, "--check", env=env, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await p.communicate()
+        _secure_gst_ok = p.returncode == 0 and out.strip() == b"ok"
+    return _secure_gst_ok
+
+
 async def _spawn(env, args):
     """args: kwargs for _build_pipeline minus shell. Returns (proc, mode, enc).
-    Network output only ever runs through the worker, which reads the pipeline (and so the
-    stream key) from stdin. gst-launch would put the key in argv, readable by any local process
-    via /proc/<pid>/cmdline, so it is refused (fail closed) and kept for local Diagnostics only."""
+    Network output uses either the PyGObject worker or a stdin-fed gst-launch runner that disables
+    /proc access before exec, keeping the stream key unreadable to other local users."""
     if await _gi_available(env):
         pipe, enc = _build_pipeline(**{k: v for k, v in args.items() if k != "_duration"}, shell=False)
         proc = await asyncio.create_subprocess_exec(
@@ -228,9 +242,19 @@ async def _spawn(env, args):
         await proc.stdin.drain()
         proc.stdin.close()
         return proc, "worker", enc
-    if args.get("sink_el") != "filesink":
-        raise RuntimeError(NO_GI_MSG)
-    pipe, enc = _build_pipeline(**{k: v for k, v in args.items() if k != "_duration"}, shell=True)
+    network = args.get("sink_el") != "filesink"
+    if network and not await _secure_gst_available(env):
+        raise RuntimeError(NO_SECURE_GST_MSG)
+    pipe, enc = _build_pipeline(**{k: v for k, v in args.items() if k != "_duration"}, shell=False)
+    if network:
+        proc = await asyncio.create_subprocess_exec(
+            SYS_PY, GST_LAUNCH_WORKER, env=env, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True, limit=1 << 20)
+        proc.stdin.write(json.dumps({"pipeline": pipe}).encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+        return proc, "gst-launch", enc
     proc = await asyncio.create_subprocess_shell(
         f"exec gst-launch-1.0 -e -m {pipe}", env=env, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, start_new_session=True, limit=1 << 20)
