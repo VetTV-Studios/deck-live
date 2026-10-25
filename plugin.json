@@ -1,7 +1,7 @@
 {
   "name": "Deck Live",
   "author": "Vet",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "flags": [],
   "api_version": 1,
   "publish": {
@@ -10,9 +10,11 @@
       "youtube",
       "twitch",
       "rtmp",
-      "recording"
+      "recording",
+      "game-help",
+      "guides"
     ],
-    "description": "Live stream Game Mode gameplay to YouTube or Twitch from the Quick Access menu, with hardware H.264 encoding, game + mic audio, A/V sync control and auto-reconnect.",
-    "image": "https://opengraph.githubassets.com/1/VetTV-Studios/deck-live"
+    "description": "Stream Game Mode to YouTube or Twitch from Quick Access with hardware H.264, mic mix, A/V sync, auto-reconnect, and in-panel YouTube Game Help for the running title.",
+    "image": "https://raw.githubusercontent.com/VetTV-Studios/deck-live/main/assets/icon.png"
   }
 }

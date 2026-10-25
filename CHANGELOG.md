@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.0 — 2026-10-25
+- **Game Help**: YouTube help videos for the running game in the Quick Access panel — topics (walkthrough, boss, achievements, handheld best settings, what to do next), custom search, locked-achievement guides, pinned channel (default VetTV Handheld), 7-day cache, API quota guard, yt-dlp no-key fallback, offline cache, and pre-fetch on game launch.
+- First search uses the game just detected (no dropped search from unflushed React state). Prefetch and panel searches share one cache lock so YouTube quota is spent once.
+- yt-dlp on `PATH` is preferred; the optional in-plugin zipapp is pinned to 2026.08.19 and runs only after a SHA256 match against the published release checksum.
+- Session hardening: a stream watcher crash stops the encoder; a second Go Live while starting returns "Already live"; diagnostics replaces a symlinked test path instead of following it.
+- Installer: `install.sh` rejects zip path escapes and requires `plugin.json`, `main.py`, and `dist/index.js` before unpacking.
+- Store readiness: PNG store icon (`assets/icon.png`), expanded `publish` tags/description, CI (frontend build, Python unit tests, shellcheck), and Decky Plugin Database submission notes in `STORE.md`.
+- Keeps 1.0.3 SteamOS path: protected `gst-launch` runner when PyGObject is unavailable, with stream-key isolation.
+
 ## 1.0.3 — 2026-10-23
 - SteamOS compatibility: Go Live can now use systems that have GStreamer but not PyGObject, using a protected gst-launch runner that receives the pipeline over stdin and disables ptrace access before exec to keep the stream key out of readable process arguments.
 - Streaming still fails closed if the operating system cannot protect the process arguments. Health statistics remain available with PyGObject; the gst-launch runner reports live/offline status without detailed health.
