@@ -13,6 +13,42 @@ info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m✔\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m✘ Error:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Reject path escapes and require the plugin layout. Reads the central directory only;
+# nothing is extracted. python3 is required so a bad member cannot be unpacked by unzip.
+check_zip_layout() {
+    _zip=$1
+    _root=$2
+    command -v python3 >/dev/null 2>&1 || die "python3 is required to verify the zip layout before unpacking"
+    python3 - "$_zip" "$_root" <<'PY'
+import sys, zipfile
+zpath, root = sys.argv[1], sys.argv[2]
+try:
+    z = zipfile.ZipFile(zpath)
+except zipfile.BadZipFile:
+    sys.stderr.write("zip is corrupt\n")
+    sys.exit(1)
+names = z.namelist()
+z.close()
+for n in names:
+    norm = n.replace("\\", "/")
+    parts = [p for p in norm.split("/") if p not in ("", ".")]
+    if norm.startswith("/") or ".." in parts:
+        sys.stderr.write("zip member escapes the archive: %s\n" % n)
+        sys.exit(1)
+need = ["%s/plugin.json" % root, "%s/main.py" % root, "%s/dist/index.js" % root]
+missing = [p for p in need if p not in set(names)]
+if missing:
+    sys.stderr.write("unexpected zip layout (missing %s)\n" % ", ".join(missing))
+    sys.exit(1)
+PY
+}
+
+if [ "${1:-}" = "--check-zip" ]; then
+    [ -n "${2:-}" ] || die "usage: install.sh --check-zip <file.zip>"
+    check_zip_layout "$2" "$PLUGIN_DIR_NAME"
+    exit 0
+fi
+
 # --- preflight -------------------------------------------------------------
 [ -d "$PLUGINS_DIR" ] || die "Decky Loader not found ($PLUGINS_DIR missing). Install Decky first: https://decky.xyz"
 command -v curl >/dev/null 2>&1 || die "curl is required"
@@ -50,6 +86,8 @@ else
 fi
 
 # --- extract & validate ----------------------------------------------------
+# Layout is checked before any member is written to disk.
+check_zip_layout "$TMP/plugin.zip" "$PLUGIN_DIR_NAME"
 mkdir "$TMP/x"
 if command -v unzip >/dev/null 2>&1; then
     unzip -q "$TMP/plugin.zip" -d "$TMP/x" || die "zip is corrupt"

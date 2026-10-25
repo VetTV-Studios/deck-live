@@ -10,6 +10,14 @@
 - Logs and error messages redact the stream key (raw and percent-encoded) and any `rtmp://` / `rtmps://` URL.
 - `settings.json` (stream keys) is now created with mode 0600 from the start, fsync'd, and its folder is 0700. A file left 0644 by an older build is tightened on load.
 
+## Unreleased (feature/game-help)
+- Game Help add-on (Stadia Lab spec 04): YouTube help videos for the running game. Topics, custom search, locked-achievement guides, pinned channel, 7-day cache, API quota guard, yt-dlp no-key fallback, offline cache, and pre-fetch on game launch.
+- The first search uses the game just detected. It no longer reads React state before `setState` has flushed, which dropped that search.
+- A search and a prefetch for the same query share one cache lock, so the YouTube quota is spent once.
+- yt-dlp on `PATH` is preferred. The in-plugin copy is the pinned 2026.08.19 zipapp and runs only when its SHA256 matches the published release checksum.
+- A stream watcher crash stops the encoder instead of leaving it running after the panel shows Offline. A second Go Live while the first is still starting is ignored.
+- Diagnostics replaces a symlinked test path instead of following it. `install.sh` checks zip members for path escapes and the expected layout before it unpacks.
+
 ## 1.0.1 — 2026-10-13
 - New `install.sh`: one-line installer and updater (`curl -L …/install.sh | sh`) that needs no Decky developer mode. It downloads the latest release, swaps the plugin folder atomically, and restarts plugin_loader. It works with stock tools (curl, unzip or a python3 fallback, systemctl).
 - New `uninstall.sh` (`PURGE=1` also removes settings and stream keys).
