@@ -23,7 +23,7 @@ const ghInstallYtdlp = callable<[], { ok: boolean; error?: string }>("gh_install
 
 const TOPIC_LABELS: Record<string, string> = {
   walkthrough: "Walkthrough", boss: "Boss guide", achievements: "Achievements",
-  settings: "Best settings (Legion Go)", next: "What to do next",
+  settings: "Best settings (handheld)", next: "What to do next",
 };
 
 export type { RunningGame };
@@ -88,7 +88,15 @@ export function GameHelpSection() {
   const [keyInput, setKeyInput] = useState("");
   const [pinInput, setPinInput] = useState("");
 
-  const loadCfg = async () => { const c = await ghGetSettings(); setCfg(c); setPinInput(c.pin_channel); };
+  const loadCfg = async () => {
+    try {
+      const c = await ghGetSettings();
+      setCfg(c);
+      setPinInput(c.pin_channel);
+    } catch {
+      setCfg({ enabled: false, has_key: false, pin_channel: "", quota_used: 0, quota_limit: 0, ytdlp: false, topics: [] });
+    }
+  };
 
   const run = async (t: string, extra = "", refresh = false, detected: RunningGame | null = null) => {
     const target = resolveSearchGame(detected, game);
@@ -159,7 +167,7 @@ export function GameHelpSection() {
                 <div style={{ display: "flex", gap: 8, alignItems: "center", textAlign: "left" }}>
                   <img src={`https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`} style={{ width: 96, height: 54, objectFit: "cover", flexShrink: 0 }} />
                   <div style={{ fontSize: 11, lineHeight: 1.25, overflow: "hidden" }}>
-                    <div style={{ fontWeight: "bold" }}>{v.pinned ? "📌 " : ""}{v.title}</div>
+                    <div style={{ fontWeight: "bold" }}>{v.pinned ? "[Pinned] " : ""}{v.title}</div>
                     <div style={{ opacity: 0.7 }}>{[v.channel, fmtDur(v.duration), fmtViews(v.views)].filter(Boolean).join(" · ")}</div>
                   </div>
                 </div>

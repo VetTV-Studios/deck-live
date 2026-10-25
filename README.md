@@ -1,6 +1,8 @@
 # Deck Live
 
-A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube** or **Twitch** from the Quick Access menu, without switching to Desktop Mode.
+A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube** or **Twitch** from the Quick Access menu, without switching to Desktop Mode — plus **Game Help** YouTube guides for the game you are playing.
+
+![Deck Live store icon](assets/icon.png)
 
 ## Features
 - Platform picker (YouTube, Twitch) with a masked stream-key field. Keys are stored locally only (`settings.json`, mode 600), redacted from logs, and never passed on a command line.
@@ -11,30 +13,27 @@ A Decky Loader plugin that lets you live stream Game Mode gameplay to **YouTube*
 - Live status, uptime, and health (fps, kbps, dropped/duplicated frames, stall warnings).
 - **Auto-reconnect**: after an unexpected drop it retries after 2, 5, 10, 20, then every 30 s, for up to 5 min. The panel shows "Reconnecting (n)…" and uptime is kept. Stop cancels.
 - **Run Diagnostics**: records a 20 s test to `~/Videos/decky-live-test.flv` without going live. It reports capture node, encoder, audio sources and level, frames vs expected, stalls, and file length vs wall-clock time.
+- **Game Help**: while a game is running, search YouTube for walkthroughs, boss guides, achievement guides, handheld best settings, or a custom query. Locked Steam achievements can be picked for targeted guides. Results open in the Steam overlay browser (press B to return).
 
-## Game Help (preview, branch `feature/game-help`)
-While a game is running, the panel shows YouTube help videos for it:
-- Pick a topic (Walkthrough, Boss guide, Achievements, Best settings for Legion Go, What to do next) or type your own search.
-- Pick one of your **locked achievements** to get guides for it.
-- Tap a video to open it on youtube.com in the Steam overlay browser; press B to return to the game.
-
-How results are fetched:
-- **YouTube API key (optional):** your own YouTube Data API v3 key, set in *Game Help settings*. It's stored locally (mode 600) and never logged. `search.list` has its own default quota of 100 calls/day per Google project, so Deck Live stops at 90 and switches to no-key mode until midnight PT.
-- **No-key mode:** uses `yt-dlp` when it is already on `PATH`. *Download yt-dlp* fetches the pinned 2026.08.19 zipapp and keeps it only when the SHA256 matches the checksum published with that release. A file that does not match is deleted and never run.
-- **Caching:** results are cached for 7 days per game and topic, so reopening the panel uses no quota. When offline, cached results are shown with an "OFFLINE" badge.
-- **Pinned channel:** defaults to VetTV Handheld (`UCTf3fhasLYzcP4LmSOd6mIw`), whose matching videos show first. Change or clear it in Game Help settings.
+## Game Help details
+- **YouTube API key (optional):** your own YouTube Data API v3 key, set in *Game Help settings*. Stored locally (mode 600) and never logged. Deck Live stops API search at 90 calls/day (below Google’s default 100) and switches to no-key mode until midnight PT.
+- **No-key mode:** uses `yt-dlp` on `PATH`, or a user-initiated download of the pinned 2026.08.19 zipapp kept only when its SHA256 matches the published release checksum.
+- **Caching:** 7 days per query; offline serves stale cache with an OFFLINE badge.
+- **Pinned channel:** defaults to VetTV Handheld (`UCTf3fhasLYzcP4LmSOd6mIw`); change or clear it in settings. Matching pinned videos sort first.
+- Prefetch: when a game starts, a default walkthrough search is warmed into cache after a short delay (does not interrupt streaming).
 
 ## Requirements
 - Decky Loader (API v1) in Game Mode (gamescope exposes the PipeWire video node `gamescope`).
 - PipeWire with pipewire-pulse (`pactl`, `pw-dump`).
 - GStreamer (tested with 1.28; 1.20+ likely needed for the `va` plugin) with `gst-launch-1.0`, `gst-inspect-1.0` and these elements: `pipewiresrc`, `pulsesrc`, `vapostproc`, `vah264enc` (or one of the fallback encoders), `h264parse`, `videorate`, `avenc_aac` (or `fdkaacenc`), `flvmux`, `rtmp2sink`. `level` and `webrtcdsp` are optional.
 - Required for streaming: system `python3` and GStreamer with the elements above. When PyGObject (`gi`, package `python3-gobject`) and the GStreamer typelibs are available, the worker reads the pipeline, including the stream key, from stdin. Otherwise, a protected `gst-launch-1.0` runner reads the pipeline over stdin and disables ptrace access before exec, preventing other local users from reading the key from `/proc/<pid>/cmdline`; health stats are unavailable in this mode. Go Live is refused if the system cannot protect the process arguments.
+- Game Help (optional): network access; optional YouTube API key; optional `yt-dlp`.
 
 ## Tested devices
 | Device | OS | Result |
 |---|---|---|
 | Lenovo Legion Go | Bazzite (GStreamer 1.28.8) | ✅ 1080p60 to YouTube, smooth, in sync at −160 ms |
-| Steam Deck LCD/OLED | SteamOS Stable/Beta/Preview | ❓ untested (requires the listed GStreamer elements; private gst-launch mode supports systems without PyGObject) |
+| Steam Deck LCD/OLED | SteamOS Stable/Beta/Preview | ❓ needs store-review testing (gst-launch path supports systems without PyGObject) |
 
 ## Install
 
@@ -58,17 +57,22 @@ To uninstall:
 2. Decky → Settings (gear) → General → enable **Developer mode**.
 3. Decky → Settings → **Developer** → **Install Plugin from ZIP**, then pick the zip. (Or use **Install Plugin from URL** with `https://github.com/VetTV-Studios/deck-live/releases/latest/download/deck-live.zip`.)
 
-Not listed in the Decky Plugin Store.
+### Option 3: Decky Plugin Store
+After the Plugin Database PR is merged, install from Decky → Store → search **Deck Live**. See [`STORE.md`](STORE.md) for the submission checklist.
 
 ## Usage
 1. Open Quick Access, then Deck Live.
 2. Choose a platform, paste the stream key, and tap Save Key.
 3. Choose a preset (optional), and tap **Go Live**.
 4. Use **Run Diagnostics** first if anything looks wrong.
+5. With a game running, use **Game Help** to pick a topic or search, then open a video in the overlay browser.
 
 ## Build
     pnpm install && pnpm build
-    ./package.sh        # -> ../deck-live.zip (includes both streaming runners)
+    ./package.sh        # -> ../deck-live.zip (streaming workers + gamehelp + store icon)
+
+    pnpm test           # Python unit suite
+    # CI also runs: frontend build, search-game TS test, shellcheck
 
 ## How it works
 `main.py` (the Decky backend) builds a GStreamer pipeline and runs it in `gst_worker.py` (system python3 + PyGObject) when available. Otherwise, it starts `gst-launch-1.0` through `gst_launch_worker.py`; that runner reads the pipeline from stdin and disables ptrace access before exec, preventing other local users from reading the key from `/proc/<pid>/cmdline`:
@@ -79,6 +83,8 @@ Not listed in the Decky Plugin Store.
       → flvmux(streamable) → rtmp2sink (async-connect, sync=false)
 
 The worker reports stats as JSON on stdout. The backend forwards them to the panel and logs them every 10 s (Decky plugin log under `~/homebrew/logs/`).
+
+Game Help (`gamehelp.py`) searches YouTube via the Data API or yt-dlp, caches in SQLite under the plugin runtime dir, and never blocks the streamer event loop for network I/O.
 
 ## Ingest URLs
 | Platform | URL |
@@ -94,4 +100,8 @@ Kick, Facebook and Rumble can be re-enabled later via `PLATFORMS` and `ENABLED_P
 - Gamescope only sends frames when the screen changes. Static scenes are filled with duplicates, which is expected.
 - Changing audio output (for example plugging in headphones) mid-stream keeps capturing the old device until a reconnect or restart.
 - No bitrate adaptation; on weak uplinks use 720p.
-- Not yet tested on SteamOS.
+- Steam Deck SteamOS store testing still required for Plugin Database approval.
+- Game Help needs network; without an API key or yt-dlp, search cannot fetch new results (cached results still work offline).
+
+## License
+BSD-3-Clause. See `LICENSE`.

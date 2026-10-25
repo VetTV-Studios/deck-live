@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.0 — 2026-10-25
+- **Game Help**: YouTube help videos for the running game in the Quick Access panel — topics (walkthrough, boss, achievements, handheld best settings, what to do next), custom search, locked-achievement guides, pinned channel (default VetTV Handheld), 7-day cache, API quota guard, yt-dlp no-key fallback, offline cache, and pre-fetch on game launch.
+- First search uses the game just detected (no dropped search from unflushed React state). Prefetch and panel searches share one cache lock so YouTube quota is spent once.
+- yt-dlp on `PATH` is preferred; the optional in-plugin zipapp is pinned to 2026.08.19 and runs only after a SHA256 match against the published release checksum.
+- Session hardening: a stream watcher crash stops the encoder; a second Go Live while starting returns "Already live"; diagnostics replaces a symlinked test path instead of following it.
+- Installer: `install.sh` rejects zip path escapes and requires `plugin.json`, `main.py`, and `dist/index.js` before unpacking.
+- Store readiness: PNG store icon (`assets/icon.png`), expanded `publish` tags/description, CI (frontend build, Python unit tests, shellcheck), and Decky Plugin Database submission notes in `STORE.md`.
+- Keeps 1.0.3 SteamOS path: protected `gst-launch` runner when PyGObject is unavailable, with stream-key isolation.
+
 ## 1.0.3 — 2026-10-23
 - SteamOS compatibility: Go Live can now use systems that have GStreamer but not PyGObject, using a protected gst-launch runner that receives the pipeline over stdin and disables ptrace access before exec to keep the stream key out of readable process arguments.
 - Streaming still fails closed if the operating system cannot protect the process arguments. Health statistics remain available with PyGObject; the gst-launch runner reports live/offline status without detailed health.
@@ -9,14 +18,6 @@
 - A failed PyGObject check is no longer cached, so installing `python3-gobject` works after a reload instead of a Decky restart.
 - Logs and error messages redact the stream key (raw and percent-encoded) and any `rtmp://` / `rtmps://` URL.
 - `settings.json` (stream keys) is now created with mode 0600 from the start, fsync'd, and its folder is 0700. A file left 0644 by an older build is tightened on load.
-
-## Unreleased (feature/game-help)
-- Game Help add-on (Stadia Lab spec 04): YouTube help videos for the running game. Topics, custom search, locked-achievement guides, pinned channel, 7-day cache, API quota guard, yt-dlp no-key fallback, offline cache, and pre-fetch on game launch.
-- The first search uses the game just detected. It no longer reads React state before `setState` has flushed, which dropped that search.
-- A search and a prefetch for the same query share one cache lock, so the YouTube quota is spent once.
-- yt-dlp on `PATH` is preferred. The in-plugin copy is the pinned 2026.08.19 zipapp and runs only when its SHA256 matches the published release checksum.
-- A stream watcher crash stops the encoder instead of leaving it running after the panel shows Offline. A second Go Live while the first is still starting is ignored.
-- Diagnostics replaces a symlinked test path instead of following it. `install.sh` checks zip members for path escapes and the expected layout before it unpacks.
 
 ## 1.0.1 — 2026-10-13
 - New `install.sh`: one-line installer and updater (`curl -L …/install.sh | sh`) that needs no Decky developer mode. It downloads the latest release, swaps the plugin folder atomically, and restarts plugin_loader. It works with stock tools (curl, unzip or a python3 fallback, systemctl).

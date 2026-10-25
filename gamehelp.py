@@ -39,7 +39,8 @@ TOPICS = {
     "walkthrough": "{game} walkthrough",
     "boss": "{game} boss guide",
     "achievements": "{game} achievement guide",
-    "settings": "{game} Legion Go best settings",
+    # Handheld-first: covers Steam Deck, Legion Go, ROG Ally, etc.
+    "settings": "{game} handheld best settings",
     "next": "{game} what to do next",
 }
 _EDITION = re.compile(
@@ -165,7 +166,7 @@ class GameHelp:
 
     # ---------- providers ----------
     def _http_json(self, url):
-        req = urllib.request.Request(url, headers={"User-Agent": "DeckLive-GameHelp/1.1"})
+        req = urllib.request.Request(url, headers={"User-Agent": "DeckLive-GameHelp/2.0"})
         try:
             with urllib.request.urlopen(req, timeout=8, context=_ssl_ctx()) as r:
                 return json.loads(r.read().decode())

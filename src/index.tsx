@@ -93,7 +93,7 @@ function Content() {
           <PanelSectionRow>
             <div style={{ fontSize: 11, color: (health.gap_ms ?? 0) > 500 || (health.kbps ?? 1) === 0 ? "#fa0" : "#aaa" }}>
               {health.fps === undefined
-                ? (health.mode === "gst-launch" ? "Health: unavailable (no PyGObject)" : "Health: waiting…")
+                ? (health.mode === "gst-launch" ? "Health: basic (gst-launch mode)" : "Health: waiting…")
                 : `Health: ${health.fps} fps · ${health.kbps} kbps · dropped ${(health.dropped ?? 0) + (health.q_overruns ?? 0)}` +
                   ` · dup ${health.duplicated ?? 0}` + ((health.gap_ms ?? 0) > 500 ? ` · STALL ${health.gap_ms} ms` : "")}
             </div>
@@ -166,6 +166,9 @@ function Content() {
       </PanelSection>
       <PanelSection title="Diagnostics">
         <PanelSectionRow>
+          <Field label="Plugin version" description="Deck Live 2.0.0" />
+        </PanelSectionRow>
+        <PanelSectionRow>
           <ButtonItem layout="below" disabled={diagBusy || st.live}
             onClick={async () => { setDiagBusy(true); setDiag(null);
               try { setDiag(await runDiagnostics()); } finally { setDiagBusy(false); } }}>
@@ -180,7 +183,7 @@ function Content() {
               </div>
               <div>Capture node: {diag.node ?? "not found"}</div>
               <div>Encoder: {diag.encoder ?? "none"}</div>
-              {(diag.warnings ?? []).map((w) => <div style={{ color: "#fa0" }}>⚠ {w}</div>)}
+              {(diag.warnings ?? []).map((w, i) => <div key={i} style={{ color: "#fa0" }}>Warning: {w}</div>)}
               <div>Frames: {diag.frames ?? "n/a"} / {diag.expected_frames ?? "?"} expected · max gap {diag.max_gap_ms ?? "n/a"} ms</div>
               <div>Capture (gamescope) {diag.src_fps ?? "n/a"} fps unique · encoded/duplicated by videorate {diag.duplicated ?? "n/a"}</div>
               <div>Dropped {diag.dropped ?? "n/a"} · file {diag.file_duration ?? "n/a"} s / wall {diag.wall_seconds ?? "n/a"} s · runner {diag.mode ?? "?"}</div>

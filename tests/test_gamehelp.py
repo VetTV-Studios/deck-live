@@ -26,7 +26,7 @@ class T(unittest.TestCase):
         self.assertEqual(gh.normalize_game("Death Stranding Director's Cut Edition"), "Death Stranding")
         self.assertEqual(gh.normalize_game("Celeste"), "Celeste game")
         self.assertEqual(gh.build_query("Hades II", "achievement", "Nightmare"), "Hades II Nightmare achievement guide")
-        self.assertEqual(gh.build_query("Hades II", "settings"), "Hades II Legion Go best settings")
+        self.assertEqual(gh.build_query("Hades II", "settings"), "Hades II handheld best settings")
 
     def test_iso_duration(self):
         self.assertEqual(gh._iso_dur("PT1H2M3S"), 3723)
