@@ -54,7 +54,8 @@ PRESETS = {
 DEFAULTS = {"platform": "youtube", "preset": "1080p60", "mic": False, "mic_gain": 50, "game_vol": 100, "av_offset": -160,
             "keys": {}, "custom_urls": {},
             "gh_api_key": "", "gh_pin_channel": "UCTf3fhasLYzcP4LmSOd6mIw", "gh_enabled": True,
-            "chat_platform": "twitch", "chat_channel": "", "chat_yt_key": "", "chat_oauth": "", "chat_login": ""}
+            "chat_platform": "twitch", "chat_channel": "", "chat_yt_key": "", "chat_oauth": "",
+            "chat_yt_oauth": "", "chat_login": "", "chat_yt_quota_date": "", "chat_yt_quota_used": 0}
 
 
 def _load():
@@ -836,9 +837,32 @@ class Plugin:
         if chatcore is None:
             raise RuntimeError("Chat core module failed to load")
         if self._chat is None:
-            self._chat = chatcore.ChatCore(decky.logger)
+            s = _load()
+
+            def save_quota(date, used):
+                settings = _load()
+                settings["chat_yt_quota_date"] = date
+                settings["chat_yt_quota_used"] = used
+                _save(settings)
+
+            self._chat = chatcore.ChatCore(
+                decky.logger, quota_used=s.get("chat_yt_quota_used", 0),
+                quota_date=s.get("chat_yt_quota_date", ""), quota_callback=save_quota)
             self._chat.bus.subscribe(self._on_chat_event)
         return self._chat
+
+    async def _reconnect_chat_if_active(self, platform):
+        core = self._chat
+        if (core is None or core.platform != platform or core.state not in ("live", "connecting", "quota")
+                or core._task is None or core._task.done()):
+            return
+        s = _load()
+        await core.connect(
+            platform, core.channel, s.get("chat_yt_key", ""),
+            s.get("chat_oauth", "") if platform == "twitch" else "",
+            s.get("chat_login", "") if platform == "twitch" else "",
+            reconnect=core._reconnect,
+            yt_oauth=s.get("chat_yt_oauth", "") if platform == "youtube" else "")
 
     def _on_chat_event(self, event):
         emit = getattr(decky, "emit", None)
@@ -852,7 +876,7 @@ class Plugin:
     def _chat_unavailable(self):
         return {"state": "error", "platform": "twitch", "channel": "", "detail": "Chat core failed to load",
                 "messages": [], "poll": None, "overlay_url": "", "has_yt_key": False, "has_oauth": False,
-                "has_login": False, "quota_used": 0, "dropped": 0}
+                "has_yt_oauth": False, "has_login": False, "quota_used": 0, "dropped": 0}
 
     async def chat_get_state(self):
         if chatcore is None:
@@ -867,6 +891,7 @@ class Plugin:
         # Flags come from the settings file. The token and key themselves never leave it.
         snap["has_yt_key"] = bool(s.get("chat_yt_key"))
         snap["has_oauth"] = bool(s.get("chat_oauth"))
+        snap["has_yt_oauth"] = bool(s.get("chat_yt_oauth"))
         snap["has_login"] = bool(s.get("chat_login"))
         return snap
 
@@ -882,20 +907,40 @@ class Plugin:
         decky.logger.info("Chat YouTube key set")
         return True
 
+    async def chat_set_yt_oauth(self, token):
+        token = (token or "").strip()
+        if not token:
+            return True
+        s = _load()
+        changed = s.get("chat_yt_oauth") != token
+        s["chat_yt_oauth"] = token
+        _save(s)
+        if self._chat is not None:
+            self._chat.yt_oauth = token
+            if changed:
+                await self._reconnect_chat_if_active("youtube")
+        decky.logger.info("YouTube OAuth updated")
+        return True
+
     async def chat_set_oauth(self, token, login=""):
         token = (token or "").strip()
         login = (login or "").strip()
         if not token and not login:
             return True
         s = _load()
+        changed = False
         if token:
+            changed = changed or s.get("chat_oauth") != token
             s["chat_oauth"] = token
         if login:
+            changed = changed or s.get("chat_login") != login
             s["chat_login"] = login
         _save(s)
         if self._chat is not None:
             self._chat.oauth = s["chat_oauth"]
             self._chat.login = s["chat_login"]
+            if changed:
+                await self._reconnect_chat_if_active("twitch")
         decky.logger.info("Chat OAuth updated")
         return True
 
@@ -908,8 +953,12 @@ class Plugin:
         _save(s)
         core = self._chatcore()
         await core.ensure_overlay()
-        return await core.connect(s["chat_platform"], s["chat_channel"], s.get("chat_yt_key", ""),
-                                  s.get("chat_oauth", ""), s.get("chat_login", ""))
+        platform = s["chat_platform"]
+        return await core.connect(
+            platform, s["chat_channel"], s.get("chat_yt_key", ""),
+            s.get("chat_oauth", "") if platform == "twitch" else "",
+            s.get("chat_login", "") if platform == "twitch" else "",
+            yt_oauth=s.get("chat_yt_oauth", "") if platform == "youtube" else "")
 
     async def chat_disconnect(self):
         if self._chat is not None:
