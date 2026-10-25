@@ -24,8 +24,7 @@ jobs:
         run: |
           chmod +x package.sh
           ./package.sh
-          cp ../deck-live.zip deck-live.zip
-          cp ../deck-live.zip "deck-live-${GITHUB_REF_NAME}.zip"
+          cp deck-live.zip "deck-live-${GITHUB_REF_NAME}.zip"
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:

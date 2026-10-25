@@ -69,7 +69,7 @@ After the Plugin Database PR is merged, install from Decky → Store → search 
 
 ## Build
     pnpm install && pnpm build
-    ./package.sh        # -> ../deck-live.zip (streaming workers + gamehelp + store icon)
+    ./package.sh        # -> ./deck-live.zip (streaming workers + gamehelp + store icon)
 
     pnpm test           # Python unit suite
     # CI also runs: frontend build, search-game TS test, shellcheck
