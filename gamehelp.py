@@ -18,6 +18,7 @@ import re
 import shutil
 import sqlite3
 import ssl
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -266,9 +267,8 @@ class GameHelp:
     async def install_ytdlp(self):
         """Download the pinned official zipapp. It is kept only when the SHA256 matches."""
         def dl():
-            tmp = self.ytdlp_local + ".part"
+            fd, tmp = tempfile.mkstemp(prefix=".yt-dlp-", suffix=".part", dir=self.dir)
             req = urllib.request.Request(YTDLP_URL, headers={"User-Agent": "DeckLive"})
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
                 h = hashlib.sha256()
                 with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r, os.fdopen(fd, "wb") as f:

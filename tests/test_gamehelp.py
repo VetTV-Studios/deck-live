@@ -1,6 +1,6 @@
 """Backend tests for gamehelp.py. Run: python3 -m unittest discover -s tests
 Set GH_LIVE=1 to also hit YouTube through yt-dlp (needs network + yt-dlp on PATH or YTDLP)."""
-import asyncio, hashlib, io, json, logging, os, shutil, sys, tempfile, time, unittest
+import asyncio, hashlib, io, json, logging, os, shutil, sys, tempfile, threading, time, unittest
 from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import gamehelp as gh
@@ -172,6 +172,39 @@ class T(unittest.TestCase):
             self.assertEqual(path, self.g.ytdlp_local)
             self.assertEqual(self.g.ytdlp_path(), self.g.ytdlp_local)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
+
+    def test_concurrent_installs_use_unique_temporary_files(self):
+        blob = b"verified-zipapp"
+        digest = hashlib.sha256(blob).hexdigest()
+        barrier = threading.Barrier(2)
+        temp_files = []
+
+        class Body:
+            def __init__(self):
+                self._b = io.BytesIO(blob)
+            def read(self, n=-1):
+                return self._b.read(n)
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def open_url(*args, **kwargs):
+            temp_files.append([name for name in os.listdir(self.d) if name.endswith(".part")])
+            barrier.wait(timeout=5)
+            return Body()
+
+        async def install_both():
+            return await asyncio.gather(self.g.install_ytdlp(), self.g.install_ytdlp())
+
+        with mock.patch.object(gh, "YTDLP_SHA256", digest), \
+                mock.patch("urllib.request.urlopen", side_effect=open_url), \
+                mock.patch("shutil.which", return_value=None):
+            paths = self.run_(install_both())
+        self.assertEqual(paths, [self.g.ytdlp_local, self.g.ytdlp_local])
+        self.assertEqual(len(temp_files), 2)
+        self.assertEqual(len(set(temp_files[0] + temp_files[1])), 2)
+        self.assertFalse(any(name.endswith(".part") for name in os.listdir(self.d)))
 
     def test_pins_first_and_cached(self):
         main_items = [{"id": VID(i), "title": f"x{i}", "channel": "c"} for i in range(10)]
