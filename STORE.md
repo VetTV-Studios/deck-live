@@ -31,7 +31,7 @@ pnpm build
 ./package.sh   # writes ./deck-live.zip (or $DECK_LIVE_ZIP_OUT)
 ```
 
-Zip layout: `Deck Live/{dist/index.js, main.py, gst_worker.py, gst_launch_worker.py, gamehelp.py, plugin.json, package.json, README.md, LICENSE, STORE.md, assets/icon.png}`.
+Zip layout: `Deck Live/{dist/index.js, main.py, gst_worker.py, gst_launch_worker.py, gamehelp.py, plugin.json, package.json, README.md, LICENSE, STORE.md, CHANGELOG.md, assets/icon.png}`.
 
 ## Reviewer notes
 
