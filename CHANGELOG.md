@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased (feature/chat-core)
+- Shared chat core for the YouTube hub, Crowd Choice, and Crowd Play. Twitch chat is read over anonymous IRC on a WebSocket (`justinfan`); sending needs a user OAuth token. YouTube live chat polls `liveChatMessages`, waits at least `pollingIntervalMillis`, and stops at a daily quota guard. A localhost page (`127.0.0.1`) is the OBS browser source. Tokens are stored in `settings.json` (mode 0600) and are not logged. The panel shows connect status, the last 20 messages, and start/stop poll.
+
 ## 1.0.2 — 2026-10-18
 - Security: Go Live no longer falls back to `gst-launch-1.0` when PyGObject is missing. That fallback put the RTMP URL with the stream key on the command line, readable by any local process through `/proc/<pid>/cmdline`. Streaming now refuses to start with a clear message (install `python3-gobject` or update Bazzite/SteamOS). Diagnostics, which only writes a local file, can still use gst-launch.
 - A failed PyGObject check is no longer cached, so installing `python3-gobject` works after a reload instead of a Decky restart.
