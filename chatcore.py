@@ -425,6 +425,21 @@ def seconds_until_quota_reset(now=None):
     return max(1.0, (nxt - current).total_seconds())
 
 
+def quota_date_key(now=None):
+    """Return the Pacific calendar date used for YouTube quota accounting."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Los_Angeles")
+    except Exception:
+        tz = timezone(timedelta(hours=-8))
+    current = now or datetime.now(tz)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=tz)
+    else:
+        current = current.astimezone(tz)
+    return current.date().isoformat()
+
+
 def accept_value(key):
     digest = hashlib.sha1((key + WS_GUID).encode()).digest()
     return base64.b64encode(digest).decode()
@@ -774,7 +789,8 @@ class Overlay:
 
 
 class ChatCore:
-    def __init__(self, logger=None, twitch_connect=None, http_json_fn=None, sleep_fn=None, clock=None):
+    def __init__(self, logger=None, twitch_connect=None, http_json_fn=None, sleep_fn=None, clock=None,
+                 quota_path=None):
         self.log = logger or log
         self.bus = EventBus(clock=clock)
         self.overlay = Overlay(self)
@@ -786,7 +802,10 @@ class ChatCore:
         self.channel = ""
         self.state = "offline"
         self.detail = ""
+        self.quota_path = quota_path
+        self.quota_date = quota_date_key()
         self.quota_used = 0
+        self._load_quota_usage()
         self.yt_key = ""
         self.oauth = ""
         self.login = ""
@@ -800,6 +819,61 @@ class ChatCore:
         self._last_send = 0.0
         self._reconnect = True
         self.quota_limit = YT_QUOTA_GUARD
+
+    def _load_quota_usage(self):
+        if not self.quota_path:
+            return
+        try:
+            fd = os.open(self.quota_path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd) as f:
+                saved = json.load(f)
+            used = saved.get("used")
+            if (saved.get("date") == self.quota_date and type(used) is int and used >= 0):
+                self.quota_used = used
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _save_quota_usage(self):
+        if not self.quota_path:
+            return
+        directory = os.path.dirname(self.quota_path)
+        tmp = self.quota_path + ".tmp"
+        try:
+            os.makedirs(directory, exist_ok=True)
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(f.fileno(), 0o600)
+                json.dump({"date": self.quota_date, "used": self.quota_used}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.quota_path)
+        except OSError:
+            self.log.warning("Could not save YouTube quota usage")
+
+    def _refresh_quota_date(self):
+        date = quota_date_key()
+        if date != self.quota_date:
+            self.quota_date = date
+            self.quota_used = 0
+            self._save_quota_usage()
+
+    def _charge_quota(self, units):
+        self._refresh_quota_date()
+        self.quota_used += units
+        self._save_quota_usage()
+
+    def _exhaust_quota(self):
+        self._refresh_quota_date()
+        self.quota_used = self.quota_limit
+        self._save_quota_usage()
 
     def _secrets(self):
         vals = []
@@ -829,6 +903,7 @@ class ChatCore:
         self.log.info("Chat %s %s %s %s", state, self.platform or "-", self.channel or "-", detail)
 
     def snapshot(self):
+        self._refresh_quota_date()
         return {
             "state": self.state, "platform": self.platform, "channel": self.channel,
             "detail": self.detail, "messages": [m.as_dict() for m in self.messages],
@@ -880,13 +955,13 @@ class ChatCore:
 
     async def connect(self, platform, channel, yt_key="", oauth="", login="", reconnect=True):
         await self.disconnect()
+        self._refresh_quota_date()
         self.platform = (platform or "").strip().lower()
         self.channel = (channel or "").strip().lstrip("#")
         self.yt_key = (yt_key or "").strip()
         self.oauth = (oauth or "").strip()
         self.login = (login or "").strip()
         self._reconnect = reconnect
-        self.quota_used = 0
         self._stop = asyncio.Event()
         err = self._validate()
         if err:
@@ -1046,38 +1121,39 @@ class ChatCore:
         self._set_status("connecting", "")
         chat_id = self.channel
         if _VIDEO_ID_RE.match(chat_id):
+            self._refresh_quota_date()
             if self.quota_used + YT_VIDEO_COST > self.quota_limit:
                 self._set_status("quota", f"paused at {self.quota_used} units")
                 return
             body = await self._http_call(yt_video_url(chat_id), yt_headers(self.yt_key, self.oauth))
-            self.quota_used += YT_VIDEO_COST
+            self._charge_quota(YT_VIDEO_COST)
             chat_id = parse_video_chat_id(body)
             if not chat_id:
                 self._set_status("error", "That video has no active live chat")
                 return
         page = ""
         while not self._stop.is_set():
+            self._refresh_quota_date()
             if self.quota_used + YT_LIVECHAT_COST > self.quota_limit:
                 self._set_status("quota", f"paused at {self.quota_used} units")
                 await self._sleep(seconds_until_quota_reset())
                 if self._stop.is_set():
                     break
-                self.quota_used = 0
                 continue
             try:
                 body = await self._http_call(
                     yt_list_url(chat_id, page), yt_headers(self.yt_key, self.oauth))
             except QuotaExceeded:
-                self.quota_used = self.quota_limit
+                self._exhaust_quota()
                 continue
             except Exception as e:
                 self._set_status("error", redact(str(e), self._secrets()))
                 return
-            self.quota_used += YT_LIVECHAT_COST
+            self._charge_quota(YT_LIVECHAT_COST)
             try:
                 interval, page, messages = parse_livechat(body, chat_id)
             except QuotaExceeded:
-                self.quota_used = self.quota_limit
+                self._exhaust_quota()
                 continue
             except ChatError as e:
                 self._set_status("error", str(e))

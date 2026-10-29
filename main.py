@@ -836,7 +836,9 @@ class Plugin:
         if chatcore is None:
             raise RuntimeError("Chat core module failed to load")
         if self._chat is None:
-            self._chat = chatcore.ChatCore(decky.logger)
+            self._chat = chatcore.ChatCore(
+                decky.logger,
+                quota_path=os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "youtube_quota.json"))
             self._chat.bus.subscribe(self._on_chat_event)
         return self._chat
 

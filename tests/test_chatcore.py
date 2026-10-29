@@ -1,5 +1,7 @@
 """Chat core tests. Recorded fixtures only: no Twitch or YouTube network."""
-import asyncio, json, logging, os, unittest
+import asyncio, json, logging, os, tempfile, unittest
+from datetime import datetime, timezone
+from unittest import mock
 
 import chatcore as cc
 
@@ -102,6 +104,31 @@ class Bus(unittest.TestCase):
 
 
 class YouTube(unittest.TestCase):
+    def test_quota_is_persistent_until_the_pacific_day_changes(self):
+        self.assertEqual(
+            cc.quota_date_key(datetime(2026, 1, 1, 7, 30, tzinfo=timezone.utc)),
+            "2025-12-31",
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(cc, "quota_date_key", return_value="2026-10-25"):
+            path = os.path.join(directory, "youtube_quota.json")
+            for expected in (cc.YT_LIVECHAT_COST, cc.YT_LIVECHAT_COST * 2):
+                async def http(_url, _headers):
+                    return json.loads(fixture("youtube_livechat.json"))
+
+                async def sleep(_seconds):
+                    core._stop.set()
+
+                core = cc.ChatCore(http_json_fn=http, sleep_fn=sleep, quota_path=path)
+                run_session(core, platform="youtube", channel="CHATID", yt_key="test")
+                self.assertEqual(core.quota_used, expected)
+
+            with mock.patch.object(cc, "quota_date_key", return_value="2026-10-26"):
+                next_day = cc.ChatCore(quota_path=path)
+                self.assertEqual(next_day.quota_used, 0)
+                next_day._charge_quota(cc.YT_LIVECHAT_COST)
+                self.assertEqual(next_day.quota_used, cc.YT_LIVECHAT_COST)
+
     def test_fixture_parse_skips_non_text_and_honors_interval_floor(self):
         body = json.loads(fixture("youtube_livechat.json"))
         interval, page, messages = cc.parse_livechat(body, "CHATID")
