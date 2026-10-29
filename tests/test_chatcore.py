@@ -1,7 +1,7 @@
 """Chat core tests. Recorded fixtures only: no Twitch or YouTube network."""
-import asyncio, json, logging, os, tempfile, unittest
-from datetime import datetime, timezone
-from unittest import mock
+import asyncio, json, logging, os, unittest
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import chatcore as cc
 
@@ -35,7 +35,7 @@ class Irc(unittest.TestCase):
             parsed = cc.parse_irc_line(line)
             if isinstance(parsed, cc.ChatMessage):
                 messages.append(parsed)
-            elif isinstance(parsed, tuple):
+            elif isinstance(parsed, tuple) and parsed[0] == "ping":
                 pings.append(parsed)
         self.assertEqual(len(messages), 4)
         self.assertEqual(pings, [("ping", "tmi.twitch.tv")])
@@ -102,32 +102,41 @@ class Bus(unittest.TestCase):
         self.assertTrue(bus.publish({"type": "message", "n": 4}))
         self.assertEqual([e.get("n") for e in got if e["type"] == "message"], [1, 2, 4])
 
+    def test_overlay_only_receives_published_messages(self):
+        core = cc.ChatCore(clock=lambda: 0)
+        core.bus.rate = 1
+        received = []
+        core.overlay.notify = received.append
+        self.assertTrue(core._emit({"type": "message", "n": 1}))
+        self.assertFalse(core._emit({"type": "message", "n": 2}))
+        self.assertEqual([event["n"] for event in received], [1])
+
 
 class YouTube(unittest.TestCase):
-    def test_quota_is_persistent_until_the_pacific_day_changes(self):
+    def test_quota_date_uses_pacific_day_for_utc_timestamp(self):
         self.assertEqual(
             cc.quota_date_key(datetime(2026, 1, 1, 7, 30, tzinfo=timezone.utc)),
             "2025-12-31",
         )
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(cc, "quota_date_key", return_value="2026-10-25"):
-            path = os.path.join(directory, "youtube_quota.json")
-            for expected in (cc.YT_LIVECHAT_COST, cc.YT_LIVECHAT_COST * 2):
-                async def http(_url, _headers):
-                    return json.loads(fixture("youtube_livechat.json"))
 
-                async def sleep(_seconds):
-                    core._stop.set()
+    def test_quota_reset_uses_elapsed_time_across_dst(self):
+        fall_back = datetime(2026, 11, 1, 0, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
+        spring_forward = datetime(2026, 3, 8, 0, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
+        self.assertEqual(cc.seconds_until_quota_reset(fall_back), 24.5 * 60 * 60 + 5)
+        self.assertEqual(cc.seconds_until_quota_reset(spring_forward), 22.5 * 60 * 60 + 5)
 
-                core = cc.ChatCore(http_json_fn=http, sleep_fn=sleep, quota_path=path)
-                run_session(core, platform="youtube", channel="CHATID", yt_key="test")
-                self.assertEqual(core.quota_used, expected)
-
-            with mock.patch.object(cc, "quota_date_key", return_value="2026-10-26"):
-                next_day = cc.ChatCore(quota_path=path)
-                self.assertEqual(next_day.quota_used, 0)
-                next_day._charge_quota(cc.YT_LIVECHAT_COST)
-                self.assertEqual(next_day.quota_used, cc.YT_LIVECHAT_COST)
+    def test_quota_usage_survives_connections_until_pacific_date_changes(self):
+        updates = []
+        tz = ZoneInfo("America/Los_Angeles")
+        same_day = datetime.now(tz).replace(hour=12, minute=0, second=0, microsecond=0)
+        next_day = same_day + timedelta(days=1)
+        core = cc.ChatCore(quota_used=123, quota_date=cc.quota_date_key(same_day),
+                           quota_callback=lambda date, used: updates.append((date, used)))
+        core._refresh_quota_date(same_day)
+        self.assertEqual(core.quota_used, 123)
+        core._refresh_quota_date(next_day)
+        self.assertEqual(core.quota_used, 0)
+        self.assertEqual(updates, [(cc.quota_date_key(next_day), 0)])
 
     def test_fixture_parse_skips_non_text_and_honors_interval_floor(self):
         body = json.loads(fixture("youtube_livechat.json"))
@@ -155,6 +164,22 @@ class YouTube(unittest.TestCase):
         oauth_headers = cc.yt_headers(api_key="AIzaSySUPERSECRETKEY12", oauth="ya29.secret")
         self.assertEqual(oauth_headers["Authorization"], "Bearer ya29.secret")
         self.assertNotIn("X-Goog-Api-Key", oauth_headers)
+
+    def test_youtube_uses_its_oauth_not_the_twitch_oauth(self):
+        headers = []
+
+        async def http(_url, request_headers):
+            headers.append(dict(request_headers))
+            return {"items": [], "pollingIntervalMillis": 1000}
+
+        async def sleep(_seconds):
+            core._stop.set()
+
+        core = cc.ChatCore(http_json_fn=http, sleep_fn=sleep)
+        run_session(core, platform="youtube", channel="CHATID", oauth="twitch-token",
+                    yt_oauth="google-token")
+        self.assertTrue(headers[0]["Authorization"].endswith("google-token"))
+        self.assertNotIn("twitch-token", headers[0]["Authorization"])
 
     def test_poll_waits_for_the_polling_interval(self):
         first = json.loads(fixture("youtube_livechat.json"))
@@ -235,6 +260,33 @@ class YouTube(unittest.TestCase):
         self.assertNotIn("AIza", urls[0] + urls[1])
         self.assertEqual(core.quota_used, cc.YT_VIDEO_COST + cc.YT_LIVECHAT_COST)
 
+    def test_video_quota_exhaustion_waits_and_retries_resolution(self):
+        urls = []
+
+        async def http(url, _headers):
+            urls.append(url)
+            if "/videos?" in url and urls.count(url) == 1:
+                raise cc.QuotaExceeded()
+            if "/videos?" in url:
+                return {"items": [{"liveStreamingDetails": {"activeLiveChatId": "CHATID"}}]}
+            return {"items": [], "pollingIntervalMillis": 1000}
+
+        sleeps = []
+
+        async def sleep(_seconds):
+            sleeps.append(_seconds)
+            if len(sleeps) == 1:
+                core._set_quota_used(0)
+            else:
+                core._stop.set()
+
+        core = cc.ChatCore(http_json_fn=http, sleep_fn=sleep)
+        core.quota_limit = 10
+        run_session(core, platform="youtube", channel="dQw4w9WgXcQ", yt_key="AIzaSySUPERSECRETKEY12")
+        self.assertEqual(sum("/videos?" in url for url in urls), 2)
+        self.assertTrue(any("liveChatId=CHATID" in url for url in urls))
+        self.assertEqual(len(sleeps), 2)
+
     def test_errors_are_redacted(self):
         token = "oauth:super-secret-token"
         key = "AIzaSySUPERSECRETKEY12"
@@ -307,13 +359,40 @@ class TwitchSession(unittest.TestCase):
         run_session(core, platform="twitch", channel="VetTV", oauth=token, login="vet", reconnect=False)
         self.assertIn("PONG :tmi.twitch.tv", sent)
         self.assertIn("PASS oauth:super-secret-token", sent)  # on the wire, not in the log
-        self.assertEqual([m.text for m in core.messages], ["hello !1", "going !2 now", "plain hi", "!2"])
+        self.assertEqual(list(core.messages), [])
         snap = core.poll.snapshot()
-        self.assertEqual(snap["options"][0]["count"], 1)
-        self.assertEqual(snap["options"][1]["count"], 1)  # Ace's !2; Vet's later !2 does not flip
-        self.assertEqual(snap["voters"], 2)
+        self.assertEqual(snap["options"][0]["count"], 0)
+        self.assertEqual(snap["options"][1]["count"], 0)
+        self.assertEqual(snap["voters"], 0)
         logs = "\n".join(records) + json.dumps(core.snapshot())
         self.assertNotIn("super-secret-token", logs)
+        self.assertEqual(core.state, "error")
+        self.assertIn("Login authentication failed", core.detail)
+
+    def test_session_is_not_live_until_own_join_acknowledgement(self):
+        statuses = []
+
+        class FakeWs:
+            def __init__(self):
+                self.chunks = [":vet!vet@vet.tmi.twitch.tv JOIN #vettv\r\n",
+                               ":vet!vet@vet.tmi.twitch.tv PRIVMSG #vettv :hello\r\n"]
+
+            async def send_text(self, _text):
+                pass
+
+            async def recv_text(self):
+                if self.chunks:
+                    return self.chunks.pop(0)
+                raise cc.ConnectionClosed()
+
+            async def close(self):
+                pass
+
+        core = cc.ChatCore(twitch_connect=lambda: asyncio.sleep(0, result=FakeWs()))
+        core.bus.subscribe(lambda event: statuses.append(event["state"]) if event["type"] == "status" else None)
+        run_session(core, platform="twitch", channel="vettv", oauth="token", login="vet", reconnect=False)
+        self.assertLess(statuses.index("connecting"), statuses.index("live"))
+        self.assertEqual([msg.text for msg in core.messages], ["hello"])
         self.assertEqual(core.state, "offline")
 
     def test_a_flapping_socket_stops(self):
@@ -428,11 +507,48 @@ class Overlay(unittest.TestCase):
             core._emit({"type": "message", "message": {"user_name": "Ace", "text": "!2"}})
             nxt = json.loads(await asyncio.wait_for(ws.recv_text(), 2))
             self.assertEqual(nxt["message"]["text"], "!2")
-            await ws.close()
+            q = next(iter(core.overlay.clients))
+            for _ in range(q.maxsize):
+                q.put_nowait({"type": "message", "message": {}})
             await core.overlay.stop()
+            await ws.close()
+            self.assertFalse(core.overlay.clients)
+            self.assertFalse(core.overlay.connections)
             return True
 
         self.assertTrue(run(go()))
+
+    def test_websocket_rejects_foreign_origins_and_host_authorities(self):
+        core = cc.ChatCore()
+
+        async def request(headers):
+            url = await core.overlay.start(port=0)
+            port = int(url.rsplit(":", 1)[1].rstrip("/"))
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            request_headers = {
+                "Host": f"127.0.0.1:{port}",
+                "Upgrade": "websocket",
+                "Connection": "Upgrade",
+                "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                "Sec-WebSocket-Version": "13",
+                **headers,
+            }
+            writer.write(("GET /ws HTTP/1.1\r\n" + "".join(
+                f"{name}: {value}\r\n" for name, value in request_headers.items()) + "\r\n").encode())
+            await writer.drain()
+            response = await asyncio.wait_for(reader.readuntil(b"\r\n"), 2)
+            writer.close()
+            await writer.wait_closed()
+            return response
+
+        async def go():
+            foreign = await request({"Origin": "http://attacker.invalid"})
+            wrong_host = await request({"Host": "127.0.0.1:1"})
+            await core.overlay.stop()
+            self.assertIn(b"403", foreign)
+            self.assertIn(b"403", wrong_host)
+
+        run(go())
 
 
 class Redact(unittest.TestCase):

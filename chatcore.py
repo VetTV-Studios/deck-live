@@ -164,6 +164,10 @@ def parse_irc_line(line):
     cmd = parts[0].upper() if parts else ""
     if cmd == "PING":
         return ("ping", params[0] if params else trailing)
+    if cmd == "JOIN":
+        return ("join", prefix.split("!", 1)[0], params[0] if params else "")
+    if cmd == "NOTICE":
+        return ("notice", tags.get("msg-id", ""), params[-1] if params else trailing)
     if cmd != "PRIVMSG" or len(params) < 2:
         return None
     channel = params[0].lstrip("#")
@@ -422,7 +426,7 @@ def seconds_until_quota_reset(now=None):
     else:
         current = current.astimezone(tz)
     nxt = (current + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
-    return max(1.0, (nxt - current).total_seconds())
+    return max(1.0, nxt.timestamp() - current.timestamp())
 
 
 def quota_date_key(now=None):
@@ -658,6 +662,7 @@ class Overlay:
         self.server = None
         self.url = ""
         self.clients = set()
+        self.connections = {}
 
     async def start(self, host=OVERLAY_HOST, port=OVERLAY_PORT):
         if self.server is not None:
@@ -680,15 +685,29 @@ class Overlay:
         return self.url
 
     async def stop(self):
-        for q in list(self.clients):
-            with contextlib.suppress(Exception):
-                q.put_nowait(None)
-        self.clients.clear()
-        if self.server is not None:
-            self.server.close()
-            with contextlib.suppress(Exception):
-                await self.server.wait_closed()
+        server = self.server
+        if server is not None:
+            server.close()
             self.server = None
+        current = asyncio.current_task()
+        tasks = []
+        for ws, (q, task) in list(self.connections.items()):
+            while q.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    q.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(None)
+            with contextlib.suppress(Exception):
+                ws.writer.write(encode_frame(8, b""))
+            ws.writer.close()
+            if task is not current:
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if server is not None:
+            with contextlib.suppress(Exception):
+                await server.wait_closed()
 
     def notify(self, event):
         for q in list(self.clients):
@@ -725,6 +744,25 @@ class Overlay:
             writer.close()
             return
         if path == "/ws" and headers.get("upgrade", "").lower() == "websocket":
+            expected = urllib.parse.urlsplit(self.url)
+            authority = headers.get("host", "")
+            if authority.casefold() != expected.netloc.casefold():
+                writer.write(_http_response(403, "Forbidden", "invalid host"))
+                await writer.drain()
+                writer.close()
+                return
+            origin = headers.get("origin")
+            if origin:
+                parsed_origin = urllib.parse.urlsplit(origin)
+                if (parsed_origin.scheme.lower() != expected.scheme.lower()
+                        or parsed_origin.netloc.casefold() != expected.netloc.casefold()
+                        or parsed_origin.path not in ("", "/")
+                        or parsed_origin.query or parsed_origin.fragment
+                        or parsed_origin.username or parsed_origin.password):
+                    writer.write(_http_response(403, "Forbidden", "invalid origin"))
+                    await writer.drain()
+                    writer.close()
+                    return
             await self._ws(reader, writer, headers)
             return
         if path in ("/", "/index.html"):
@@ -757,6 +795,8 @@ class Overlay:
         ws = WsConn(reader, writer, mask_out=False, expect_mask=True)
         q = asyncio.Queue(maxsize=32)
         self.clients.add(q)
+        task = asyncio.current_task()
+        self.connections[ws] = (q, task)
         hello = {"type": "hello", "messages": [m.as_dict() for m in self.core.messages],
                  "poll": self.core.poll.snapshot() if self.core.poll else None}
         try:
@@ -785,12 +825,13 @@ class Overlay:
             pass
         finally:
             self.clients.discard(q)
+            self.connections.pop(ws, None)
             await ws.close()
 
 
 class ChatCore:
     def __init__(self, logger=None, twitch_connect=None, http_json_fn=None, sleep_fn=None, clock=None,
-                 quota_path=None):
+                 quota_used=0, quota_date="", quota_callback=None):
         self.log = logger or log
         self.bus = EventBus(clock=clock)
         self.overlay = Overlay(self)
@@ -802,12 +843,13 @@ class ChatCore:
         self.channel = ""
         self.state = "offline"
         self.detail = ""
-        self.quota_path = quota_path
-        self.quota_date = quota_date_key()
-        self.quota_used = 0
-        self._load_quota_usage()
+        self.quota_used = max(0, int(quota_used or 0))
+        self.quota_date = quota_date or quota_date_key()
+        self._quota_callback = quota_callback
+        self._refresh_quota_date()
         self.yt_key = ""
         self.oauth = ""
+        self.yt_oauth = ""
         self.login = ""
         self._twitch_connect = twitch_connect or connect_twitch
         self._http = http_json_fn or http_json
@@ -820,64 +862,9 @@ class ChatCore:
         self._reconnect = True
         self.quota_limit = YT_QUOTA_GUARD
 
-    def _load_quota_usage(self):
-        if not self.quota_path:
-            return
-        try:
-            fd = os.open(self.quota_path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd) as f:
-                saved = json.load(f)
-            used = saved.get("used")
-            if (saved.get("date") == self.quota_date and type(used) is int and used >= 0):
-                self.quota_used = used
-        except (OSError, ValueError, TypeError, AttributeError):
-            pass
-
-    def _save_quota_usage(self):
-        if not self.quota_path:
-            return
-        directory = os.path.dirname(self.quota_path)
-        tmp = self.quota_path + ".tmp"
-        try:
-            os.makedirs(directory, exist_ok=True)
-            try:
-                os.chmod(directory, 0o700)
-            except OSError:
-                pass
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w") as f:
-                os.fchmod(f.fileno(), 0o600)
-                json.dump({"date": self.quota_date, "used": self.quota_used}, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.quota_path)
-        except OSError:
-            self.log.warning("Could not save YouTube quota usage")
-
-    def _refresh_quota_date(self):
-        date = quota_date_key()
-        if date != self.quota_date:
-            self.quota_date = date
-            self.quota_used = 0
-            self._save_quota_usage()
-
-    def _charge_quota(self, units):
-        self._refresh_quota_date()
-        self.quota_used += units
-        self._save_quota_usage()
-
-    def _exhaust_quota(self):
-        self._refresh_quota_date()
-        self.quota_used = self.quota_limit
-        self._save_quota_usage()
-
     def _secrets(self):
         vals = []
-        for secret in (self.oauth, self.yt_key):
+        for secret in (self.oauth, self.yt_oauth, self.yt_key):
             if not secret:
                 continue
             vals.append(secret)
@@ -889,8 +876,21 @@ class ChatCore:
         return tuple(vals)
 
     def _emit(self, event, reliable=False):
-        self.bus.publish(event, reliable=reliable)
-        self.overlay.notify(event)
+        published = self.bus.publish(event, reliable=reliable)
+        if published:
+            self.overlay.notify(event)
+        return published
+
+    def _set_quota_used(self, used):
+        self.quota_used = max(0, int(used))
+        if self._quota_callback is not None:
+            self._quota_callback(self.quota_date, self.quota_used)
+
+    def _refresh_quota_date(self, now=None):
+        today = quota_date_key(now)
+        if today != self.quota_date:
+            self.quota_date = today
+            self._set_quota_used(0)
 
     def _set_status(self, state, detail=""):
         detail = redact(detail, self._secrets())[:300]
@@ -953,13 +953,14 @@ class ChatCore:
         self._emit({"type": "poll", "poll": snap}, reliable=True)
         return snap
 
-    async def connect(self, platform, channel, yt_key="", oauth="", login="", reconnect=True):
+    async def connect(self, platform, channel, yt_key="", oauth="", login="", reconnect=True, yt_oauth=""):
         await self.disconnect()
         self._refresh_quota_date()
         self.platform = (platform or "").strip().lower()
         self.channel = (channel or "").strip().lstrip("#")
         self.yt_key = (yt_key or "").strip()
-        self.oauth = (oauth or "").strip()
+        self.oauth = (oauth or "").strip() if self.platform == "twitch" else ""
+        self.yt_oauth = ((yt_oauth or oauth) or "").strip() if self.platform == "youtube" else ""
         self.login = (login or "").strip()
         self._reconnect = reconnect
         self._stop = asyncio.Event()
@@ -978,7 +979,7 @@ class ChatCore:
         if self.platform == "youtube":
             if not self.channel:
                 return "Enter a YouTube video id or live chat id"
-            if not self.yt_key and not self.oauth:
+            if not self.yt_key and not self.yt_oauth:
                 return "YouTube chat needs an API key or OAuth token"
             return ""
         return "Choose Twitch or YouTube"
@@ -1058,9 +1059,12 @@ class ChatCore:
                 self._set_status("connecting", "")
                 ws = await self._twitch_connect()
                 self._ws = ws
-                for line in twitch_login_lines(self.channel, self.oauth, self.login):
+                login_lines = twitch_login_lines(self.channel, self.oauth, self.login)
+                self._twitch_nick = next(
+                    (line.split(" ", 1)[1].lower() for line in login_lines if line.startswith("NICK ")), "")
+                self._twitch_joined = False
+                for line in login_lines:
                     await ws.send_text(line)
-                self._set_status("live", "")
                 buf = ""
                 while not self._stop.is_set():
                     chunk = await ws.recv_text()
@@ -1068,12 +1072,16 @@ class ChatCore:
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         await self._on_irc(line)
-                    if buf:
+                        if self._stop.is_set():
+                            break
+                    if buf and not self._stop.is_set():
                         # A frame may be one complete IRC line with no newline.
                         parsed = parse_irc_line(buf)
                         if parsed is not None:
                             await self._on_irc(buf)
                             buf = ""
+                            if self._stop.is_set():
+                                break
             except asyncio.CancelledError:
                 raise
             except ConnectionClosed:
@@ -1108,7 +1116,23 @@ class ChatCore:
             if self._ws is not None:
                 await self._ws.send_text("PONG :" + parsed[1])
             return
-        if isinstance(parsed, ChatMessage):
+        if isinstance(parsed, tuple) and parsed[0] == "notice":
+            msg_id, message = parsed[1], parsed[2]
+            if (msg_id in ("login_authentication_failed", "improperly_formatted_auth", "invalid_nick",
+                           "msg_channel_not_found", "msg_banned", "msg_channel_suspended",
+                           "msg_requires_verified_phone_number", "msg_verified_email_required")
+                    or re.search(r"login authentication failed|invalid auth|unable to join|channel not found|"
+                                 r"banned from the channel|channel is suspended", message, re.I)):
+                self._set_status("error", message or "Twitch rejected the login or channel join")
+                self._stop.set()
+            return
+        if isinstance(parsed, tuple) and parsed[0] == "join":
+            nick, channel = parsed[1], parsed[2]
+            if nick.lower() == getattr(self, "_twitch_nick", "") and channel.lstrip("#").lower() == self.channel.lower():
+                self._twitch_joined = True
+                self._set_status("live", "")
+            return
+        if isinstance(parsed, ChatMessage) and getattr(self, "_twitch_joined", False):
             self._on_message(parsed)
 
     async def _http_call(self, url, headers):
@@ -1119,41 +1143,44 @@ class ChatCore:
 
     async def _run_youtube(self):
         self._set_status("connecting", "")
-        chat_id = self.channel
-        if _VIDEO_ID_RE.match(chat_id):
-            self._refresh_quota_date()
-            if self.quota_used + YT_VIDEO_COST > self.quota_limit:
-                self._set_status("quota", f"paused at {self.quota_used} units")
-                return
-            body = await self._http_call(yt_video_url(chat_id), yt_headers(self.yt_key, self.oauth))
-            self._charge_quota(YT_VIDEO_COST)
-            chat_id = parse_video_chat_id(body)
-            if not chat_id:
-                self._set_status("error", "That video has no active live chat")
-                return
+        video_id = self.channel if _VIDEO_ID_RE.match(self.channel) else ""
+        chat_id = "" if video_id else self.channel
         page = ""
         while not self._stop.is_set():
             self._refresh_quota_date()
-            if self.quota_used + YT_LIVECHAT_COST > self.quota_limit:
-                self._set_status("quota", f"paused at {self.quota_used} units")
-                await self._sleep(seconds_until_quota_reset())
-                if self._stop.is_set():
+            if video_id and not chat_id:
+                if not await self._wait_for_youtube_quota(YT_VIDEO_COST):
                     break
-                continue
+                try:
+                    body = await self._http_call(
+                        yt_video_url(video_id), yt_headers(self.yt_key, self.yt_oauth))
+                    self._set_quota_used(self.quota_used + YT_VIDEO_COST)
+                    chat_id = parse_video_chat_id(body)
+                except QuotaExceeded:
+                    self._set_quota_used(self.quota_limit)
+                    continue
+                except Exception as e:
+                    self._set_status("error", redact(str(e), self._secrets()))
+                    return
+                if not chat_id:
+                    self._set_status("error", "That video has no active live chat")
+                    return
+            if not await self._wait_for_youtube_quota(YT_LIVECHAT_COST):
+                break
             try:
                 body = await self._http_call(
-                    yt_list_url(chat_id, page), yt_headers(self.yt_key, self.oauth))
+                    yt_list_url(chat_id, page), yt_headers(self.yt_key, self.yt_oauth))
             except QuotaExceeded:
-                self._exhaust_quota()
+                self._set_quota_used(self.quota_limit)
                 continue
             except Exception as e:
                 self._set_status("error", redact(str(e), self._secrets()))
                 return
-            self._charge_quota(YT_LIVECHAT_COST)
+            self._set_quota_used(self.quota_used + YT_LIVECHAT_COST)
             try:
                 interval, page, messages = parse_livechat(body, chat_id)
             except QuotaExceeded:
-                self._exhaust_quota()
+                self._set_quota_used(self.quota_limit)
                 continue
             except ChatError as e:
                 self._set_status("error", str(e))
@@ -1165,3 +1192,14 @@ class ChatCore:
             await self._sleep(interval / 1000.0)
         if self.state != "error":
             self._set_status("offline", "")
+
+    async def _wait_for_youtube_quota(self, cost):
+        self._refresh_quota_date()
+        if self.quota_used + cost <= self.quota_limit:
+            return True
+        self._set_status("quota", f"paused at {self.quota_used} units")
+        await self._sleep(seconds_until_quota_reset())
+        if self._stop.is_set():
+            return False
+        self._refresh_quota_date()
+        return True

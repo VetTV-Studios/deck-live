@@ -10,7 +10,7 @@ type PollSnap = { open: boolean; voters: number; options: { label: string; count
 type ChatState = {
   state: string; platform: string; channel: string; detail: string;
   messages: ChatMsg[]; poll: PollSnap; overlay_url: string;
-  has_yt_key: boolean; has_oauth: boolean; has_login: boolean; quota_used: number;
+  has_yt_key: boolean; has_yt_oauth: boolean; has_oauth: boolean; has_login: boolean; quota_used: number;
 };
 type ChatEvent = {
   type: string; state?: string; platform?: string; channel?: string; detail?: string;
@@ -21,6 +21,7 @@ const chatGetState = callable<[], ChatState>("chat_get_state");
 const chatConnect = callable<[string, string], { ok: boolean; error?: string }>("chat_connect");
 const chatDisconnect = callable<[], boolean>("chat_disconnect");
 const chatSetYtKey = callable<[string], boolean>("chat_set_yt_key");
+const chatSetYtOauth = callable<[string], boolean>("chat_set_yt_oauth");
 const chatSetOauth = callable<[string, string], boolean>("chat_set_oauth");
 const chatStartPoll = callable<[string], PollSnap>("chat_start_poll");
 const chatStopPoll = callable<[], PollSnap>("chat_stop_poll");
@@ -57,6 +58,7 @@ export function ChatSection() {
   const [channel, setChannel] = useState("");
   const [busy, setBusy] = useState(false);
   const [ytKey, setYtKey] = useState("");
+  const [ytOauth, setYtOauth] = useState("");
   const [oauth, setOauth] = useState("");
   const [login, setLogin] = useState("");
   const [draft, setDraft] = useState("");
@@ -80,7 +82,7 @@ export function ChatSection() {
   }, []);
 
   if (!st) return <PanelSection title="Chat"><PanelSectionRow>Loading…</PanelSectionRow></PanelSection>;
-  const connected = st.state === "live" || st.state === "connecting";
+  const connected = st.state === "live" || st.state === "connecting" || st.state === "quota";
 
   const toggle = async () => {
     setBusy(true);
@@ -160,6 +162,15 @@ export function ChatSection() {
         <ButtonItem layout="below" disabled={busy || !ytKey.trim()} onClick={async () => {
           await chatSetYtKey(ytKey); setYtKey(""); await refresh();
         }}>Save YouTube key</ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField label={st.has_yt_oauth ? "YouTube OAuth token (saved)" : "YouTube OAuth token"}
+          bIsPassword value={ytOauth} onChange={(e) => setYtOauth(e.target.value)} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy || !ytOauth.trim()} onClick={async () => {
+          await chatSetYtOauth(ytOauth); setYtOauth(""); await refresh();
+        }}>Save YouTube OAuth</ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
         <TextField label={st.has_login ? "Twitch login (saved)" : "Twitch login"}
