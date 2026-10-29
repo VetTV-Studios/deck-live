@@ -1,6 +1,6 @@
 """Chat core tests. Recorded fixtures only: no Twitch or YouTube network."""
 import asyncio, json, logging, os, unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import chatcore as cc
@@ -113,6 +113,12 @@ class Bus(unittest.TestCase):
 
 
 class YouTube(unittest.TestCase):
+    def test_quota_date_uses_pacific_day_for_utc_timestamp(self):
+        self.assertEqual(
+            cc.quota_date_key(datetime(2026, 1, 1, 7, 30, tzinfo=timezone.utc)),
+            "2025-12-31",
+        )
+
     def test_quota_reset_uses_elapsed_time_across_dst(self):
         fall_back = datetime(2026, 11, 1, 0, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
         spring_forward = datetime(2026, 3, 8, 0, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -121,15 +127,16 @@ class YouTube(unittest.TestCase):
 
     def test_quota_usage_survives_connections_until_pacific_date_changes(self):
         updates = []
-        core = cc.ChatCore(quota_used=123, quota_date="2026-10-25",
+        tz = ZoneInfo("America/Los_Angeles")
+        same_day = datetime.now(tz).replace(hour=12, minute=0, second=0, microsecond=0)
+        next_day = same_day + timedelta(days=1)
+        core = cc.ChatCore(quota_used=123, quota_date=cc.quota_date_key(same_day),
                            quota_callback=lambda date, used: updates.append((date, used)))
-        same_day = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
-        next_day = datetime(2026, 10, 26, 0, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
         core._refresh_quota_date(same_day)
         self.assertEqual(core.quota_used, 123)
         core._refresh_quota_date(next_day)
         self.assertEqual(core.quota_used, 0)
-        self.assertEqual(updates, [("2026-10-26", 0)])
+        self.assertEqual(updates, [(cc.quota_date_key(next_day), 0)])
 
     def test_fixture_parse_skips_non_text_and_honors_interval_floor(self):
         body = json.loads(fixture("youtube_livechat.json"))

@@ -429,7 +429,8 @@ def seconds_until_quota_reset(now=None):
     return max(1.0, nxt.timestamp() - current.timestamp())
 
 
-def pacific_quota_date(now=None):
+def quota_date_key(now=None):
+    """Return the Pacific calendar date used for YouTube quota accounting."""
     try:
         from zoneinfo import ZoneInfo
         tz = ZoneInfo("America/Los_Angeles")
@@ -843,7 +844,7 @@ class ChatCore:
         self.state = "offline"
         self.detail = ""
         self.quota_used = max(0, int(quota_used or 0))
-        self.quota_date = quota_date or pacific_quota_date()
+        self.quota_date = quota_date or quota_date_key()
         self._quota_callback = quota_callback
         self._refresh_quota_date()
         self.yt_key = ""
@@ -886,7 +887,7 @@ class ChatCore:
             self._quota_callback(self.quota_date, self.quota_used)
 
     def _refresh_quota_date(self, now=None):
-        today = pacific_quota_date(now)
+        today = quota_date_key(now)
         if today != self.quota_date:
             self.quota_date = today
             self._set_quota_used(0)
@@ -902,6 +903,7 @@ class ChatCore:
         self.log.info("Chat %s %s %s %s", state, self.platform or "-", self.channel or "-", detail)
 
     def snapshot(self):
+        self._refresh_quota_date()
         return {
             "state": self.state, "platform": self.platform, "channel": self.channel,
             "detail": self.detail, "messages": [m.as_dict() for m in self.messages],
@@ -953,6 +955,7 @@ class ChatCore:
 
     async def connect(self, platform, channel, yt_key="", oauth="", login="", reconnect=True, yt_oauth=""):
         await self.disconnect()
+        self._refresh_quota_date()
         self.platform = (platform or "").strip().lower()
         self.channel = (channel or "").strip().lstrip("#")
         self.yt_key = (yt_key or "").strip()
@@ -960,7 +963,6 @@ class ChatCore:
         self.yt_oauth = ((yt_oauth or oauth) or "").strip() if self.platform == "youtube" else ""
         self.login = (login or "").strip()
         self._reconnect = reconnect
-        self._refresh_quota_date()
         self._stop = asyncio.Event()
         err = self._validate()
         if err:
